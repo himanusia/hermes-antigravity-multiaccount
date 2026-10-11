@@ -383,10 +383,15 @@ class AntigravityStream(Iterator[Any]):
         """
         self.close()
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+    def _close_blocking(self) -> None:
+        """Blocking close body: process termination, lock release, executor retirement.
+
+        Extracted so ``close()`` can dispatch this to a daemon thread when
+        called from a thread with a running asyncio event loop, avoiding a
+        ~2 s block on ``proc.wait(timeout=2)`` inside ``terminate_process``.
+        The operation order is identical to the pre-extraction ``close()``
+        body; every invariant documented on the individual steps still holds.
+        """
         if self.is_worker:
             # Terminate the worker only if it is still OURS. The interrupted
             # path runs at an arbitrary later time on an arbitrary thread --
@@ -408,6 +413,41 @@ class AntigravityStream(Iterator[Any]):
         # _retire_executor); a second call is a harmless no-op because an
         # already-shut-down executor accepts shutdown() again.
         self._retire_executor()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # When called from a thread that owns a running asyncio event loop
+        # (e.g. Hermes' _aggregate_chat_stream_async finally block), the
+        # blocking cleanup -- proc.terminate() + proc.wait(timeout=2) inside
+        # terminate_process, plus the client RLock acquisition in
+        # _terminate_worker -- would stall the loop for up to ~2 s. Detect
+        # that situation and dispatch the work to a dedicated daemon thread
+        # so close() returns immediately. Outside an event loop (the common
+        # sync path, GC finalizers, explicit close() from user code) the
+        # cleanup runs inline, preserving the original synchronous contract.
+        #
+        # The daemon thread is NOT the stream's private async executor and
+        # NOT the loop's default executor: the private executor may already
+        # be shut down (or its single thread may be blocked in readline),
+        # and the default executor must not be occupied for ~2 s (the same
+        # starvation __anext__ avoids). A fresh daemon thread costs one
+        # stack allocation and exits as soon as cleanup finishes; daemon
+        # status ensures it cannot keep the process alive past interpreter
+        # shutdown.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop: synchronous close, same as before.
+            self._close_blocking()
+            return
+        # Running loop detected: defer blocking work.
+        threading.Thread(
+            target=self._close_blocking,
+            name="agy-stream-close",
+            daemon=True,
+        ).start()
 
     def _make_chunk(
         self,
@@ -498,6 +538,20 @@ class AntigravityStream(Iterator[Any]):
             return "no result event, process still alive"
         return f"no result event, process exited with return code {process_exit}"
 
+    def _get_stderr_tail(self) -> str:
+        """Retrieve bounded stderr tail from the drainer, or fall back to direct read."""
+        drainer = getattr(self.proc, "_stderr_drainer", None)
+        if drainer is not None and hasattr(drainer, "get_tail"):
+            return drainer.get_tail(timeout=1.0)
+        stream = getattr(self.proc, "stderr", None)
+        if stream is not None and hasattr(stream, "read") and callable(stream.read):
+            try:
+                out = stream.read()
+                return out if isinstance(out, str) else ""
+            except Exception:
+                return ""
+        return ""
+
     def _stream_generator(self) -> Iterator[Any]:
         deadline = time.monotonic() + self.timeout
         text_buffer = ""
@@ -576,6 +630,8 @@ class AntigravityStream(Iterator[Any]):
                     init_data = event.get("init", {})
                     if not self.conversation_id:
                         self.conversation_id = init_data.get("conversation_id", "")
+                    if self.conversation_id and self.is_worker and self.client and hasattr(self.client, "_set_worker_conversation_id"):
+                        self.client._set_worker_conversation_id(self.conversation_id)
 
                 elif event_type == "step_update":
                     step = event.get("step_update", {})
@@ -653,6 +709,8 @@ class AntigravityStream(Iterator[Any]):
                     res = event.get("result", {})
                     if not self.conversation_id:
                         self.conversation_id = res.get("conversation_id", "")
+                    if self.conversation_id and self.is_worker and self.client and hasattr(self.client, "_set_worker_conversation_id"):
+                        self.client._set_worker_conversation_id(self.conversation_id)
                     status = res.get("status", "")
                     if "usage" in res:
                         usage_data = res["usage"]
@@ -717,7 +775,7 @@ class AntigravityStream(Iterator[Any]):
                 except subprocess.TimeoutExpired:
                     self.client._terminate_process(self.proc)
 
-                stderr_out = self.proc.stderr.read() if self.proc.stderr else ""
+                stderr_out = self._get_stderr_tail()
                 # Raw poll(), NOT `poll() or 0`: a process that is still
                 # alive (None) must stay None. The old coercion fabricated
                 # "exited 0" for it, and the empty-result message then named
@@ -754,7 +812,7 @@ class AntigravityStream(Iterator[Any]):
                 # produced nothing is the empty-result raise's job below,
                 # not this exit-code one. A real nonzero exit keeps the
                 # quota/exit-code raise's priority over the generic one.
-                if not has_tool_calls and not has_content and returncode not in (None, 0):
+                if not neutralized_tool_step and not has_tool_calls and not has_content and returncode not in (None, 0):
                     quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
@@ -811,11 +869,13 @@ class AntigravityStream(Iterator[Any]):
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
                 worker_exit = self.proc.poll()
-                if not has_tool_calls and not has_content and worker_exit not in (None, 0):
+                if not neutralized_tool_step and not has_tool_calls and not has_content and worker_exit not in (None, 0):
                     quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
-                    raise RuntimeError(f"Antigravity execution failed: worker process exited with return code {worker_exit}")
+                    stderr_out = self._get_stderr_tail()
+                    err_detail = error_msg or stderr_out.strip() or f"worker process exited with return code {worker_exit}"
+                    raise RuntimeError(f"Antigravity execution failed: {err_detail}")
 
                 # Positive-evidence verdict, placed AFTER the quota and
                 # exit-code checks (the more specific signals) and BEFORE the

@@ -36,6 +36,7 @@ _PROMPT_PREAMBLE = (
     "- NEVER simulate or hallucinate Tool Results (e.g. 'Tool Result (...):'). Hermes Agent executes tools externally and will supply real results in subsequent turns.",
     "- After emitting tool calls, STOP generating immediately. Do NOT generate results, execution output, or commentary after tool calls.",
     "- If no tool is needed, respond naturally with standard text.",
+    "- When the user's latest message introduces a new question or task, do NOT continue prior completed tasks or tool loops. Address the user's latest request directly.",
 )
 
 _TOOL_CALL_PREFIXES = tuple(
@@ -160,6 +161,16 @@ def _render_message_content(content: Any) -> str:
     return str(content).strip()
 
 
+def _latest_user_request_section(user_text: str) -> str:
+    """Format the canonical LATEST USER REQUEST section and anti-loop instruction."""
+    return (
+        f"### LATEST USER REQUEST TO ANSWER:\nUser:\n{user_text}\n\n"
+        "INSTRUCTION: Respond directly and specifically to the LATEST USER REQUEST above. "
+        "Do NOT repeat previous architectural summaries, code reviews, or overview boilerplate unless explicitly asked."
+        " If the LATEST USER REQUEST comments on, questions, or gives feedback about prior work rather than asking to continue it, address THAT message and do NOT silently continue the earlier task. If the user's intent is genuinely ambiguous, ask ONE short clarifying question instead of proceeding."
+    )
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -264,6 +275,16 @@ def _format_messages_as_prompt(
         if rendered_content:
             transcript.append(f"{label}:\n{rendered_content}")
 
+    if last_role == "user" and last_msg is not None and len(history_messages) > 1:
+        user_text = _render_message_content(last_msg.get("content"))
+        sections.append(
+            "### ACTIVE OBJECTIVE:\n"
+            f"The user has submitted a new request:\n\"{user_text}\"\n\n"
+            "CRITICAL: The conversation transcript below is historical background. "
+            "Do NOT silently continue prior tool execution loops or earlier coding tasks unless explicitly requested by the ACTIVE OBJECTIVE. "
+            "Focus your attention on answering the new request."
+        )
+
     if transcript:
         sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
 
@@ -276,11 +297,7 @@ def _format_messages_as_prompt(
         )
     elif last_role == "user" and last_msg is not None:
         user_text = _render_message_content(last_msg.get("content"))
-        sections.append(
-            f"### LATEST USER REQUEST TO ANSWER:\nUser:\n{user_text}\n\n"
-            "INSTRUCTION: Respond directly and specifically to the LATEST USER REQUEST above. "
-            "Do NOT repeat previous architectural summaries, code reviews, or overview boilerplate unless explicitly asked."
-        )
+        sections.append(_latest_user_request_section(user_text))
     else:
         sections.append("Continue the conversation from the latest message.")
     return "\n\n".join(s.strip() for s in sections if s and s.strip())
@@ -305,13 +322,21 @@ def _messages_match_prefix(history: Sequence[dict[str, Any]], incoming: Sequence
 
 def _format_delta_prompt(new_messages: Sequence[dict[str, Any]]) -> str:
     """Format only the incremental messages in an ongoing multi-turn interaction."""
+    valid_messages = [m for m in new_messages if isinstance(m, dict)]
+    if not valid_messages:
+        return ""
+
+    last_msg = valid_messages[-1]
+    last_role = str(last_msg.get("role") or "").strip().lower()
+
+    if last_role == "user":
+        prior_messages = valid_messages[:-1]
+    else:
+        prior_messages = valid_messages
+
     parts: list[str] = []
-    last_role = ""
-    for msg in new_messages:
-        if not isinstance(msg, dict):
-            continue
+    for msg in prior_messages:
         role = str(msg.get("role") or "").strip().lower()
-        last_role = role
         rendered_content = _render_message_content(msg.get("content"))
         if role == "tool":
             tool_id = str(msg.get("tool_call_id") or msg.get("name") or "tool").strip()
@@ -350,12 +375,15 @@ def _format_delta_prompt(new_messages: Sequence[dict[str, Any]]) -> str:
             parts.append(f"{label}:\n{rendered_content}")
 
     if last_role == "tool":
-        parts.append("Continue the conversation from the latest tool result.")
-    elif last_role == "user":
         parts.append(
-            "Respond directly and specifically to the latest user request above. "
-            "Do NOT repeat previous architectural summaries or boilerplate."
+            "Continue the conversation from the latest tool result. "
+            "REMINDER: You are in HEADLESS INFERENCE MODE. Native tools are disabled. "
+            "If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in your text output. "
+            "Do NOT invoke native tools directly."
         )
+    elif last_role == "user":
+        user_text = _render_message_content(last_msg.get("content"))
+        parts.append(_latest_user_request_section(user_text))
     else:
         parts.append("Continue the conversation from the latest message above.")
     return "\n\n".join(s.strip() for s in parts if s and s.strip())

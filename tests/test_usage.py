@@ -2,6 +2,8 @@
 
 import json
 import sys
+import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -297,6 +299,13 @@ class TestSnapshotAndRendering(unittest.TestCase):
 
 class TestCachingAndQuery(unittest.TestCase):
     def setUp(self):
+        self._reset_cache()
+
+    def tearDown(self):
+        self._reset_cache()
+
+    @staticmethod
+    def _reset_cache():
         import usage
         with usage._cache_lock:
             usage._cached_usage = None
@@ -337,10 +346,103 @@ class TestCachingAndQuery(unittest.TestCase):
         # for fresh data, so failure should be surfaced as None.
         stale = fetch_subscription_usage(force_refresh=True)
         self.assertIsNone(stale)
+        self.assertEqual(mock_query.call_count, 2)
+
+        # Expire cache so the subsequent non-forced call bypasses the fresh fast path
+        # and exercises the stale-cache fallback on query failure.
+        import usage
+        with usage._cache_lock:
+            usage._cached_timestamp = time.time() - usage.USAGE_CACHE_TTL_SECONDS - 1.0
 
         # Non-forced callers still get the stale-cache fallback on failure.
         stale = fetch_subscription_usage()
         self.assertEqual(stale, sample_usage)
+        self.assertEqual(mock_query.call_count, 3)
+
+    @patch("usage._query_agy_usage")
+    def test_single_flight_concurrent_queries_expired_cache(self, mock_query):
+        sample_usage = parse_agy_usage(SAMPLE_AGY_USAGE_JSON)
+        query_started = threading.Event()
+        release_query = threading.Event()
+
+        def side_effect(*args, **kwargs):
+            query_started.set()
+            release_query.wait(timeout=5.0)
+            return sample_usage
+
+        mock_query.side_effect = side_effect
+
+        n_threads = 5
+        results = [None] * n_threads
+
+        def worker(idx):
+            results[idx] = fetch_subscription_usage()
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+
+        # Start first thread to trigger and hold query in flight
+        threads[0].start()
+        self.assertTrue(query_started.wait(timeout=2.0))
+
+        # Start remaining threads while query is in flight
+        for t in threads[1:]:
+            t.start()
+
+        # Brief sleep to allow waiting threads to attempt lock acquisition
+        time.sleep(0.05)
+
+        # Release the query
+        release_query.set()
+
+        for t in threads:
+            t.join(timeout=3.0)
+
+        # Only one subprocess query should be executed
+        self.assertEqual(mock_query.call_count, 1)
+        for res in results:
+            self.assertEqual(res, sample_usage)
+
+    @patch("usage._query_agy_usage")
+    def test_single_flight_force_refresh_reuses_in_flight_query(self, mock_query):
+        sample_usage = parse_agy_usage(SAMPLE_AGY_USAGE_JSON)
+        query_started = threading.Event()
+        release_query = threading.Event()
+
+        def side_effect(*args, **kwargs):
+            query_started.set()
+            release_query.wait(timeout=5.0)
+            return sample_usage
+
+        mock_query.side_effect = side_effect
+
+        results = {}
+
+        def background_worker():
+            results["bg"] = fetch_subscription_usage()
+
+        t_bg = threading.Thread(target=background_worker)
+        t_bg.start()
+        self.assertTrue(query_started.wait(timeout=2.0))
+
+        # force_refresh waiting behind an in-flight refresh must reuse the new result
+        def force_worker():
+            results["force"] = fetch_subscription_usage(force_refresh=True)
+
+        t_force = threading.Thread(target=force_worker)
+        t_force.start()
+
+        # Let force_worker enter and wait for the refresh lock
+        time.sleep(0.05)
+
+        # Release query
+        release_query.set()
+
+        t_bg.join(timeout=3.0)
+        t_force.join(timeout=3.0)
+
+        self.assertEqual(mock_query.call_count, 1)
+        self.assertEqual(results["bg"], sample_usage)
+        self.assertEqual(results["force"], sample_usage)
 
     @patch("usage.resolve_agy_command", return_value="/nonexistent/agy")
     @patch("usage.setup_isolated_home", return_value=("/tmp/home", False))
@@ -351,6 +453,18 @@ class TestCachingAndQuery(unittest.TestCase):
 
 
 class TestProviderIntegration(unittest.TestCase):
+    def setUp(self):
+        import usage
+        with usage._cache_lock:
+            usage._cached_usage = None
+            usage._cached_timestamp = 0.0
+
+    def tearDown(self):
+        import usage
+        with usage._cache_lock:
+            usage._cached_usage = None
+            usage._cached_timestamp = 0.0
+
     @patch("usage.fetch_subscription_usage")
     def test_provider_profile_fetch_account_usage(self, mock_fetch):
         mock_fetch.return_value = parse_agy_usage(SAMPLE_AGY_USAGE_JSON)

@@ -150,7 +150,15 @@ def _slow_readline(
         if thread_names is not None:
             thread_names.append(threading.current_thread().name)
         if thread_counts is not None:
-            thread_counts.append(threading.active_count())
+            thread_counts.append(
+                len(
+                    [
+                        t
+                        for t in threading.enumerate()
+                        if t.is_alive() and t.name.startswith("agy-stream")
+                    ]
+                )
+            )
         time.sleep(latency)
         return next(pending, "")
 
@@ -446,23 +454,37 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
             with self.assertRaises(StopAsyncIteration):
                 asyncio.run(_await_directly(stream.__anext__()))
 
-    def _assert_executor_threads_gone(self, executor: Any, baseline: int, timeout: float = 1.0) -> None:
+    def _assert_executor_threads_gone(
+        self,
+        executor: Any = None,
+        timeout: float = 1.0,
+    ) -> None:
         """No agy-stream thread may outlive the stream's end.
 
         ``executor._threads`` keeps finished Thread objects around for joining
-        (CPython does not remove them), so liveness plus the process-wide
-        active count are the honest signals here.
+        (CPython does not remove them), so liveness of the executor's worker
+        threads and ensuring no 'agy-stream' thread remains alive in the
+        process are the honest signals here, without depending on global thread
+        counts that daemon threads (e.g. agy-stderr-drainer) perturb.
         """
         deadline = time.monotonic() + timeout
-        live = [t for t in executor._threads if t.is_alive()]
+
+        def _live_stream_threads() -> list[threading.Thread]:
+            threads: set[threading.Thread] = set()
+            if executor is not None and hasattr(executor, "_threads"):
+                threads.update(t for t in executor._threads if t.is_alive())
+            threads.update(
+                t
+                for t in threading.enumerate()
+                if t.is_alive() and t.name.startswith("agy-stream")
+            )
+            return [t for t in threads if t.is_alive()]
+
+        live = _live_stream_threads()
         while live and time.monotonic() < deadline:
             time.sleep(0.01)
-            live = [t for t in executor._threads if t.is_alive()]
-        self.assertFalse(live, "an agy-stream thread outlived the stream")
-        deadline = time.monotonic() + timeout
-        while threading.active_count() > baseline and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertEqual(threading.active_count(), baseline)
+            live = _live_stream_threads()
+        self.assertFalse(live, f"an agy-stream thread outlived the stream: {live}")
 
     def test_exhausted_worker_stream_retires_its_executor(self):
         # The worker SUCCESS path deliberately does not call close() (the
@@ -472,7 +494,6 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
         # StopIteration path does that, for sync and async consumers alike
         # (__anext__ reaches it through _pull_chunk -> __next__).
         client = self._client()
-        baseline_threads = threading.active_count()
         with patch("subprocess.Popen", return_value=_mock_proc(self._turn_lines())):
             stream = client.chat.completions.create(model=MODEL, messages=MESSAGES, stream=True)
 
@@ -494,7 +515,7 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
         executor = stream._async_executor
         self.assertIsNotNone(executor)
         self.assertTrue(executor._shutdown)
-        self._assert_executor_threads_gone(executor, baseline_threads)
+        self._assert_executor_threads_gone(executor)
         # close() after exhaustion stays idempotent, and the stream is done.
         stream.close()
         stream.close()
@@ -676,7 +697,6 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
         client = self._client()
         read_threads: list[str] = []
         read_thread_counts: list[int] = []
-        baseline_threads = threading.active_count()
         proc = _mock_proc([])
         proc.stdout.readline.side_effect = _slow_readline(
             _lines_for(_turn_events("conv-1", "answer one", TURN_1_USAGE)),
@@ -706,15 +726,16 @@ class AsyncStreamSemanticsTests(_PinnedSeamsMixin, unittest.TestCase):
             any(name.startswith(("asyncio_", "ThreadPoolExecutor-")) for name in read_threads),
             "a shared default-executor thread performed the blocking read",
         )
-        # Bounded thread growth: the private executor thread plus the quota
-        # watchdog the generator starts, and nothing else.
+        # Bounded thread growth: exactly one private executor thread performs
+        # the read, without spawning uncontrolled worker threads.
         self.assertTrue(read_thread_counts)
         for count in read_thread_counts:
-            self.assertLessEqual(count - baseline_threads, 3)
+            self.assertEqual(count, 1)
         # The executor itself is single-threaded and named for the stream.
         stream_executor = stream._async_executor
         self.assertIsNotNone(stream_executor)
         self.assertEqual(stream_executor._max_workers, 1)
+        self._assert_executor_threads_gone(stream_executor)
 
 
 @unittest.skipIf(

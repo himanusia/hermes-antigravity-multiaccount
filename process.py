@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +78,85 @@ def terminate_process(proc: subprocess.Popen) -> None:
         proc.wait(timeout=2)
     except Exception:
         _kill_process_tree(proc)
+
+
+_DEFAULT_STDERR_LIMIT = 64 * 1024  # 64 KiB of text
+
+
+class StderrDrainer:
+    """Continuously drains a subprocess stderr in a daemon thread, retaining a bounded tail."""
+
+    def __init__(self, proc: subprocess.Popen, max_chars: int = _DEFAULT_STDERR_LIMIT) -> None:
+        self._proc = proc
+        self._max_chars = max(0, int(max_chars))
+        self._lock = threading.Lock()
+        self._buffer: deque[str] = deque()
+        self._buffered_chars = 0
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> StderrDrainer:
+        stream = getattr(self._proc, "stderr", None)
+        if stream is None or not hasattr(stream, "read") or not callable(stream.read):
+            return self
+
+        thread = threading.Thread(
+            target=self._drain_loop,
+            name="agy-stderr-drainer",
+            daemon=True,
+        )
+        self._thread = thread
+        thread.start()
+        return self
+
+    def _drain_loop(self) -> None:
+        stream = getattr(self._proc, "stderr", None)
+        if stream is None:
+            return
+        while True:
+            try:
+                chunk = stream.read(4096)
+            except Exception:
+                break
+            if not chunk or not isinstance(chunk, str):
+                break
+
+            with self._lock:
+                if len(chunk) >= self._max_chars:
+                    self._buffer.clear()
+                    self._buffer.append(chunk[-self._max_chars:])
+                    self._buffered_chars = self._max_chars
+                else:
+                    self._buffer.append(chunk)
+                    self._buffered_chars += len(chunk)
+                    while self._buffer and (self._buffered_chars - len(self._buffer[0])) >= self._max_chars:
+                        popped = self._buffer.popleft()
+                        self._buffered_chars -= len(popped)
+
+    def get_tail(self, timeout: float = 1.0) -> str:
+        """Wait briefly for the drainer thread to complete and return the accumulated tail."""
+        if (
+            self._thread is not None
+            and self._thread.is_alive()
+            and threading.current_thread() != self._thread
+            and getattr(self._proc, "poll", lambda: None)() is not None
+        ):
+            self._thread.join(timeout=max(0.0, float(timeout)))
+
+        with self._lock:
+            text = "".join(self._buffer)
+            if len(text) > self._max_chars:
+                return text[-self._max_chars:]
+            return text
+
+
+def start_stderr_drainer(proc: subprocess.Popen, max_chars: int = _DEFAULT_STDERR_LIMIT) -> StderrDrainer:
+    """Create and start a daemon StderrDrainer. Attached to proc only if a thread starts."""
+    drainer = StderrDrainer(proc, max_chars=max_chars)
+    drainer.start()
+    if drainer._thread is not None:
+        with contextlib.suppress(Exception):
+            proc._stderr_drainer = drainer
+    return drainer
 
 
 def resolve_agy_command() -> str:
@@ -590,15 +672,122 @@ def _link_macos_keychains(isolated_home: Path) -> None:
         os.symlink(real_keychains, isolated_keychains, target_is_directory=True)
 
 
+# Names that look like credentials. Hermes itself runs with gateway and dashboard secrets in its
+# environment (SLACK_BOT_TOKEN, TELEGRAM_BOT_TOKEN, *_API_KEY, ...); agy is a closed-source binary and
+# has no use for any of them, so they are removed from the child environment by default.
+#
+# This is a NAME heuristic. It also covers names whose value is a secret by convention (webhook URLs,
+# DSNs, cookies, database and broker URLs), but it cannot know what an arbitrarily named variable
+# holds. ``ANTIGRAVITY_ENV_STRICT`` (allow-list mode) is the reliable way to guarantee what agy sees.
+_SECRET_NAME_RE = re.compile(
+    r"(^|_)(TOKENS?|SECRETS?|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?|AUTH|"
+    r"WEBHOOKS?|DSN|COOKIES?)($|_)"
+    r"|(^|_)(DATABASE|DB|REDIS|MONGO\w*|POSTGRES\w*|MYSQL|AMQP|BROKER|CACHE)_(URL|URI)($|_)",
+    re.IGNORECASE,
+)
+# Names that match the pattern but are not Hermes secrets and that agy or git over ssh may need.
+# (Bare SESSION is deliberately not in the pattern: DBUS_SESSION_BUS_ADDRESS is how agy reaches the
+# Linux keyring for its own sign-in.)
+_SECRET_NAME_ALLOW = frozenset({"SSH_AUTH_SOCK", "GPG_AGENT_INFO"})
+_STRICT_VALUES = frozenset({"1", "true", "yes", "on"})
+_STRICT_BASELINE = frozenset({
+    "PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "TMPDIR", "TEMP", "TMP",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "SSH_AUTH_SOCK",
+    # Linux keyring sign-in (agy stores its session in the freedesktop Secret Service over D-Bus)
+    "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
+    # Windows needs these to start a process at all
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
+    "AGY_CLI_DISABLE_AUTO_UPDATE", "AGY_CLI_MODEL_API_MAX_RETRIES",
+})
+
+
+def _norm(name: str) -> str:
+    """Environment names are case-insensitive on Windows."""
+    return name.upper() if os.name == "nt" else name
+
+
+def _env_names(var: str) -> set[str]:
+    return {_norm(n.strip()) for n in os.environ.get(var, "").split(",") if n.strip()}
+
+
+def _filtered_parent_env() -> dict[str, str]:
+    """Parent environment minus anything that looks like a credential.
+
+    ``ANTIGRAVITY_ENV_PASSTHROUGH`` (comma separated names) keeps specific variables that the
+    pattern would drop. ``ANTIGRAVITY_ENV_STRICT`` (1, true, yes or on) goes further and passes
+    only the variables named in ``ANTIGRAVITY_ENV_ALLOWLIST`` plus a minimal baseline (PATH,
+    locale, temp dirs, TERM, TZ, proxy and certificate variables, keyring and Windows basics).
+    """
+    keep = _env_names("ANTIGRAVITY_ENV_PASSTHROUGH")
+    if os.environ.get("ANTIGRAVITY_ENV_STRICT", "").strip().lower() in _STRICT_VALUES:
+        allowed = {_norm(n) for n in _STRICT_BASELINE} | _env_names("ANTIGRAVITY_ENV_ALLOWLIST") | keep
+        return {
+            k: v
+            for k, v in os.environ.items()
+            if _norm(k) in allowed or k.upper().startswith("LC_")
+        }
+    safe = {_norm(n) for n in _SECRET_NAME_ALLOW}
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if _norm(k) in keep or _norm(k) in safe or not _SECRET_NAME_RE.search(k)
+    }
+
+
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def apply_proxy_env(env: dict[str, str], proxy: str | None) -> None:
+    """Route agy's outbound HTTP(S) through an explicit proxy. No-op when unset."""
+    proxy = (proxy or "").strip()
+    if not proxy:
+        return
+    # agy (Go) reads only the HTTP(S) pair; ALL_PROXY is set too so tools agy
+    # spawns (curl, git, pip) don't fall back to an inherited, different proxy.
+    for key in (
+        "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+        "ALL_PROXY", "all_proxy",
+    ):
+        env[key] = proxy
+    # agy talks to its own local language server over loopback; that must never
+    # be routed through the proxy.
+    # Merge both casings: a parent may export NO_PROXY and no_proxy with
+    # different entries. Dedup case-insensitively, keeping first spelling.
+    raw = ",".join(filter(None, (env.get("NO_PROXY"), env.get("no_proxy"))))
+    entries: dict[str, str] = {}
+    for entry in (*raw.split(","), *_LOOPBACK_HOSTS):
+        entry = entry.strip()
+        if entry:
+            entries.setdefault(entry.casefold(), entry)
+    env["NO_PROXY"] = env["no_proxy"] = ",".join(entries.values())
+
+
 def build_child_env(isolated_home: Path | str) -> dict[str, str]:
-    """Construct child environment isolating home and session storage on POSIX and Windows."""
-    env = dict(os.environ)
+    """Construct child environment isolating home and session storage on POSIX and Windows.
+
+    Credential-looking variables from the parent (Hermes) environment are not passed to agy.
+    """
+    env = _filtered_parent_env()
     home_str = str(isolated_home)
     env["HOME"] = home_str
     # Windows: Go's os.UserHomeDir() reads USERPROFILE then HOMEDRIVE+HOMEPATH
     env["USERPROFILE"] = home_str
     if "HOMEPATH" in env:
         env["HOMEPATH"] = home_str
+
+    # agy 1.2.16 detects SSH sessions via SSH_CONNECTION, SSH_CLIENT, or SSH_TTY
+    # and forces file-based token storage ("Using file-based token storage because
+    # SSH session detected"). When credentials live in the OS keyring and no real
+    # token file exists, strip these variables so agy falls back to keyring auth.
+    # Preserve SSH_AUTH_SOCK so agy tools can still use ssh-agent for git over SSH.
+    # See soyelmismo/hermes-antigravity-subscription#18.
+    if os.name != "nt" and resolve_real_token_path() is None:
+        for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
+            env.pop(var, None)
+
+    apply_proxy_env(env, os.getenv("ANTIGRAVITY_PROXY"))
     return env
 
 
@@ -639,9 +828,16 @@ def _check_early_quota_error(
             content = f.read()
 
         for line in reversed(content.splitlines()):
+            lower_line = line.lower()
+            if (
+                "ai credits balance is too low" in lower_line
+                or "credits balance is too low" in lower_line
+                or "daily or billing cap" in lower_line
+            ):
+                return line.strip()
             if "RESOURCE_EXHAUSTED" in line and (
                 "Individual quota reached" in line
-                or "quota exceeded" in line.lower()
+                or "quota exceeded" in lower_line
                 or "code 429" in line
             ):
                 start = line.find("RESOURCE_EXHAUSTED")

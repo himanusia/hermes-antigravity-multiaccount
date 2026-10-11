@@ -63,21 +63,35 @@ except ImportError:
 from providers import register_provider
 from providers.base import ProviderProfile
 
+try:
+    from .models import (
+        _FALLBACK_MODELS,
+        _MODEL_ALIASES,
+        _cached_catalog,
+        _heuristic_efforts,
+        load_catalog,
+        model_efforts,
+        resolve_model_alias,
+        split_effort_suffix,
+    )
+except ImportError:
+    # Loaded outside a package (e.g. a flat source tree under test):
+    # the absolute name is the same module.
+    from models import (
+        _FALLBACK_MODELS,
+        _MODEL_ALIASES,
+        _cached_catalog,
+        _heuristic_efforts,
+        load_catalog,
+        model_efforts,
+        resolve_model_alias,
+        split_effort_suffix,
+    )
+
 logger = logging.getLogger(__name__)
 
 # An interactive sign-in that never returns must not hang the CLI forever.
 _LOGIN_TIMEOUT_SECONDS = 600.0
-
-_FALLBACK_MODELS = (
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.1-pro",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6-thinking",
-    "gpt-oss-120b-medium",
-)
-
 
 def _rotation_accounts() -> list[dict[str, Any]]:
     """Registered accounts that can serve a request (enabled and eligible)."""
@@ -88,28 +102,6 @@ def _rotation_accounts() -> list[dict[str, Any]]:
         ]
     except Exception:
         return []
-
-
-def _clean_agy_models(stdout: str) -> list[str]:
-    """Parse `agy models` output into deduplicated base names (Gemini effort suffixes folded)."""
-    clean_models: list[str] = []
-    seen: set[str] = set()
-    for raw_line in (stdout or "").strip().splitlines():
-        line = raw_line.strip()
-        if not line or "fetching" in line.lower():
-            continue
-        parts = line.split()
-        if not parts or not any(c in parts[0].lower() for c in ("gemini", "claude", "gpt", "model")):
-            continue
-        m = base = parts[0]
-        for suffix in ("-high", "-medium", "-low"):
-            if m.endswith(suffix) and (m.startswith("gemini-") or "flash" in m or "pro" in m):
-                base = m[:-len(suffix)]
-                break
-        if base not in seen:
-            seen.add(base)
-            clean_models.append(base)
-    return clean_models
 
 
 class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
@@ -125,24 +117,21 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         self, model: str | None
     ) -> tuple[str, ...] | None:
         """Declared reasoning-effort vocabulary for models on this provider.
-        
+
         Enables Hermes /model picker and /reasoning commands to offer appropriate
-        thinking effort options (low, medium, high) for reasoning-capable models.
+        thinking effort options for reasoning-capable models. The levels come from
+        `agy models`, so they follow what agy accepts per model: Gemini Flash and
+        Claude take low/medium/high, Gemini Pro low/high, gpt-oss medium only.
         """
-        m = (model or "").lower()
-        if "gemini-3.1-pro" in m:
-            return ("low", "high")
-        if "gemini" in m or "flash" in m or "pro" in m:
-            return ("low", "medium", "high")
-        if "claude" in m:
-            # agy rejects --effort for Claude models. Offering effort levels
-            # here makes Hermes send the flag; the worker dies with a
-            # BrokenPipeError and Hermes silently falls back to OpenRouter.
-            # (Issue #15)
-            return ()
-        if "gpt" in m:
-            return ()
-        return ("low", "medium", "high")
+        name = (model or "").strip()
+        catalog = _cached_catalog()
+        resolved_name = resolve_model_alias(name, catalog)
+        base, suffix_effort = split_effort_suffix(resolved_name)
+        # No process spawn here: use the cached catalog and the built-in table.
+        efforts = model_efforts(base, refresh=False)
+        if efforts is None:
+            efforts = _heuristic_efforts(base, suffix_effort is not None)
+        return efforts
 
     def build_api_kwargs_extras(
         self,
@@ -171,40 +160,45 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
         timeout: float = 15.0,
     ) -> list[str] | None:
         """Query `agy models` and normalize to clean, deduplicated base models.
-        
+
         Separates model families from thinking efforts (e.g. `gemini-3.8-flash-{low,medium,high}`
-        becomes `gemini-3.8-flash`), allowing Hermes' native reasoning effort picker to handle
-        the thinking depth cleanly.
+        or `claude-opus-5-5-{low,medium,high}` becomes one entry), allowing Hermes' native
+        reasoning effort picker to handle the thinking depth cleanly. The result also warms
+        the effort table that `resolve_model_and_effort` reads.
         """
         try:
             try:
                 from .accounts import list_models_for_home
+                from .models import parse_catalog
             except ImportError:
                 from accounts import list_models_for_home
+                from models import parse_catalog
 
-            # Model access is per Google account. The host default account (real HOME)
-            # serves any model no rotation account has (pick_account skips accounts
-            # without the model), so offer the union of every usable account's models.
-            homes = [None] + [a["home_dir"] for a in _rotation_accounts() if a.get("home_dir")]
-            raw: list[str] = []
-            for home in homes:
-                raw.extend(list_models_for_home(home, timeout=timeout))
-            clean_models = _clean_agy_models("\n".join(raw))
-            if clean_models:
-                return clean_models
+            # The host catalog (also warms the effort table), then the models of
+            # every usable rotation account: access is per Google account, and
+            # pick_account skips accounts that lack the requested model.
+            names = list(load_catalog(timeout=timeout) or {})
+            for home in [a["home_dir"] for a in _rotation_accounts() if a.get("home_dir")]:
+                raw = "\n".join(list_models_for_home(home, timeout=timeout))
+                for name in parse_catalog(raw):
+                    if name not in names:
+                        names.append(name)
+            if names:
+                return names
         except Exception as exc:
             logger.debug("Antigravity fetch_models failed: %s", exc)
-
         return list(_FALLBACK_MODELS)
 
     def get_model_context_length(self, model: str) -> int | None:
         """Declared context window for Antigravity CLI.
-        
-        Defaults to 200,000 tokens (allowing conversations to comfortably pass
-        140k-160k tokens before auto-compression). Configurable via the
-        ANTIGRAVITY_CONTEXT_LENGTH environment variable.
+
+        Defaults to 239,000 tokens so Hermes compaction triggers safely below agy's
+        compiled internal trajectory checkpoint threshold (239,616 tokens / 256k - 16k output tokens),
+        maximizing usable context while ensuring Hermes retains sovereign context control. Multi-turn
+        trajectory persistence via native --conversation prevents hitting agy's single-turn 100,000 token limit.
+        Configurable via HERMES_ANTIGRAVITY_CONTEXT_LENGTH or ANTIGRAVITY_CONTEXT_LENGTH.
         """
-        env_val = os.environ.get("ANTIGRAVITY_CONTEXT_LENGTH")
+        env_val = os.environ.get("HERMES_ANTIGRAVITY_CONTEXT_LENGTH") or os.environ.get("ANTIGRAVITY_CONTEXT_LENGTH")
         if env_val:
             try:
                 val = int(env_val.strip())
@@ -212,7 +206,7 @@ class AntigravitySubscriptionDirectSDKProfile(ProviderProfile):
                     return val
             except ValueError:
                 pass
-        return 200_000
+        return 239_000
 
     def classify_api_error(
         self,
@@ -260,7 +254,7 @@ def _classify_antigravity_error(
     model: str | None = None,
 ) -> dict[str, Any] | None:
     """Classify agy CLI specific runtime errors so Hermes' smart failover /
-    recovery pipeline triggers auto-compression and retry instead of failing.
+    recovery pipeline triggers auto-compression, billing failover, or permanent auth abort.
     """
     err_str = f"{error} {message}".lower()
     if any(
@@ -270,7 +264,6 @@ def _classify_antigravity_error(
             "stalled for 5s",
             "empty result (status='success')",
             "empty result (status=\"success\")",
-            "context canceled",
             "max_trajectory_tokens",
             "max trajectory tokens",
         )
@@ -279,6 +272,36 @@ def _classify_antigravity_error(
             "reason": "context_overflow",
             "retryable": True,
             "should_compress": True,
+        }
+    if any(
+        pattern in err_str
+        for pattern in (
+            "ai credits balance is too low",
+            "credits balance is too low",
+            "daily or billing cap",
+            "billing cap",
+        )
+    ):
+        return {
+            "reason": "billing",
+            "retryable": False,
+            "should_fallback": True,
+            "should_compress": False,
+        }
+    if any(
+        pattern in err_str
+        for pattern in (
+            "verify your account to continue",
+            "appeal a terms of service block",
+            "terms of service block",
+            "terms of service violation",
+        )
+    ):
+        return {
+            "reason": "auth_permanent",
+            "retryable": False,
+            "should_fallback": False,
+            "should_compress": False,
         }
     return None
 
@@ -615,8 +638,9 @@ antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
     process_command_env_vars=("ANTIGRAVITY_COMMAND", "AGY_CLI_PATH", "ANTIGRAVITY_CLI_PATH"),
     process_args_env_var="ANTIGRAVITY_ARGS",
     default_aux_model="gemini-3.8-flash",
-    fallback_models=_FALLBACK_MODELS,
+    fallback_models=(),  # Account-scoped models: discovered dynamically via fetch_models() (agy models)
     supports_vision=True,
+    unsupported_response_formats=("json_schema",),
     classify_api_error=_classify_antigravity_error,
     auth_handler=antigravity_auth_handler,
 )

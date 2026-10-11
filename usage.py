@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 USAGE_CACHE_TTL_SECONDS = 60.0
 
 _cache_lock = threading.Lock()
+_refresh_lock = threading.Lock()
 _cached_usage: SubscriptionUsage | None = None
 _cached_timestamp: float = 0.0
 
@@ -320,27 +321,36 @@ def fetch_subscription_usage(
         ):
             return _cached_usage
 
-    # Subprocess runs OUTSIDE the lock: concurrent callers may each spawn an
-    # `agy` query, but none blocks another thread that holds or awaits the lock.
-    usage = _query_agy_usage(timeout=timeout)
+    # Single-flight refresh: only one thread executes _query_agy_usage at a time.
+    # Record entry timestamp before acquiring the refresh lock so any thread that
+    # waited can detect if another in-flight query already updated the cache.
+    # Subprocess execution remains outside _cache_lock so callers hitting the fast
+    # path are never blocked by an in-flight query.
+    start_time = time.time()
+    with _refresh_lock:
+        with _cache_lock:
+            if _cached_usage is not None and _cached_timestamp > start_time:
+                return _cached_usage
 
-    with _cache_lock:
-        if usage is not None:
-            _cached_usage = usage
-            _cached_timestamp = time.time()
-            return usage
+        usage = _query_agy_usage(timeout=timeout)
 
-        if force_refresh:
-            # The user explicitly asked for fresh data; silently serving stale
-            # cache would mask the refresh failure. Report it instead.
-            logger.debug("force_refresh requested but query failed; not serving stale cache")
+        with _cache_lock:
+            if usage is not None:
+                _cached_usage = usage
+                _cached_timestamp = time.time()
+                return usage
+
+            if force_refresh:
+                # The user explicitly asked for fresh data; silently serving stale
+                # cache would mask the refresh failure. Report it instead.
+                logger.debug("force_refresh requested but query failed; not serving stale cache")
+                return None
+
+            # Fallback to stale cache if available on transient failure
+            if _cached_usage is not None:
+                logger.debug("Using stale cached usage after query failure")
+                return _cached_usage
             return None
-
-        # Fallback to stale cache if available on transient failure
-        if _cached_usage is not None:
-            logger.debug("Using stale cached usage after query failure")
-            return _cached_usage
-        return None
 
 
 def _window_label(group_name: str, window: str) -> str:

@@ -402,7 +402,10 @@ class TestMultiAccount(unittest.TestCase):
         def fake_models(home, timeout=15.0):
             return ("claude-sonnet-4-6",) if home else ("claude-sonnet-5-5-medium",)
 
+        # The host lists Claude 5.5, so the alias fallback to 4.6 must not apply.
+        live_catalog = (time.monotonic() + 60, {"claude-sonnet-5-5": ("medium",)})
         with patch.object(client, "_execute_chat_completion", side_effect=mock_execute), \
+                patch("models._catalog_cache", live_catalog), \
                 patch("client.is_authenticated", return_value=True), \
                 patch("accounts.fetch_usage_for_home", return_value=None), \
                 patch.dict(os.environ, {"ANTIGRAVITY_ROTATION": "round_robin"}):

@@ -107,7 +107,7 @@ git checkout -b catalog/bump-antigravity-pin-v<version_slug>
 Edit `plugin-catalog/antigravity-subscription-directsdk.yaml`:
 - Set `sha:` to the 40-character commit SHA from Step 2.8.
 - Set `version:` to `"X.Y.Z"`.
-- Keep `description:` concise (under 600 characters). Do NOT accumulate append-only changelogs or historical version tags (`v1.0.5`, `since v1.0.3`). Summarize current runtime behavior and keep the unified `Disclosure:` block. Release notes belong in the PR body and GitHub Releases, not in the catalog manifest.
+- Keep `description:` concise (under 800 characters). Do NOT accumulate append-only changelogs or historical version tags (`v1.0.5`, `since v1.0.3`). Summarize current runtime behavior and keep the unified `Disclosure:` block. Release notes belong in the PR body and GitHub Releases, not in the catalog manifest.
 - Preserve existing security disclosures (keyring access, isolated HOME symlinks, token handling).
 - Verify `capabilities:` matches actual plugin registrations.
 
@@ -144,7 +144,7 @@ gh pr create --repo NousResearch/hermes-agent \
 Maintainers review catalog PRs in high volume. Apply these standards:
 
 ### Catalog Description Rules (`plugin-catalog/<name>.yaml`):
-1. **Length:** Keep under 600 characters. CLI table views truncate descriptions to 60 characters; web cards show short summaries. Full documentation renders from `README.md`.
+1. **Length:** Keep under 800 characters. CLI table views truncate descriptions to 60 characters; web cards show short summaries. Full documentation renders from `README.md`.
 2. **No Changelog Bloat:** Never accumulate historical release notes (`v1.0.5 prunes...`, `v1.0.6 strips...`, `since v1.0.3...`).
 3. **Current State Only:** Describe current capabilities directly.
 4. **Single Unified Disclosure:** Group security disclosures into one `Disclosure:` block (external CLI routing, private temp HOME symlink, keyring presence-only probe, no credential store writes).

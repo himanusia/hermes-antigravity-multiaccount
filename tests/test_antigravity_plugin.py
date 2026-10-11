@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -72,6 +73,9 @@ class AntigravityPluginTests(unittest.TestCase):
         self.addCleanup(patcher_token.stop)
         self.addCleanup(patcher_cmd.stop)
         self.addCleanup(patcher_keychains.stop)
+        import models
+        models._catalog_cache = None
+        self.addCleanup(lambda: setattr(models, "_catalog_cache", None))
 
     @staticmethod
     def _write_token(tmp_dir: str) -> Path:
@@ -250,6 +254,10 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("Assistant:\nHi there!", prompt)
         self.assertIn("User:\nWhat is the weather?", prompt)
         self.assertIn("get_weather", prompt)
+        self.assertIn(
+            "If the LATEST USER REQUEST comments on, questions, or gives feedback about prior work rather than asking to continue it, address THAT message and do NOT silently continue the earlier task. If the user's intent is genuinely ambiguous, ask ONE short clarifying question instead of proceeding.",
+            prompt,
+        )
 
     def test_format_messages_with_tool_call_and_result(self):
         messages = [
@@ -293,6 +301,10 @@ class AntigravityPluginTests(unittest.TestCase):
         # Verify latest user request is highlighted at tail
         self.assertIn("### LATEST USER REQUEST TO ANSWER:\nUser:\nWhy is this not following thread?", prompt)
         self.assertIn("Do NOT repeat previous architectural summaries", prompt)
+        self.assertIn(
+            "If the LATEST USER REQUEST comments on, questions, or gives feedback about prior work rather than asking to continue it, address THAT message and do NOT silently continue the earlier task. If the user's intent is genuinely ambiguous, ask ONE short clarifying question instead of proceeding.",
+            prompt,
+        )
 
     def test_format_messages_latest_tool_results(self):
         messages = [
@@ -309,7 +321,10 @@ class AntigravityPluginTests(unittest.TestCase):
         # Delta ending with user
         user_delta = [{"role": "user", "content": "new user query"}]
         d_prompt = _format_delta_prompt(user_delta)
-        self.assertIn("Respond directly and specifically to the latest user request above.", d_prompt)
+        self.assertIn("### LATEST USER REQUEST TO ANSWER:\nUser:\nnew user query", d_prompt)
+        self.assertIn("Respond directly and specifically to the LATEST USER REQUEST above.", d_prompt)
+        self.assertIn("do NOT silently continue the earlier task", d_prompt)
+        self.assertEqual(d_prompt.count("new user query"), 1)
 
         # Delta ending with tool
         tool_delta = [{"role": "tool", "tool_call_id": "t1", "content": "output"}]
@@ -627,21 +642,235 @@ class AntigravityPluginTests(unittest.TestCase):
         # Suffix override: model had -high but effort was set to low
         self.assertEqual(client._resolve_model_and_effort("gemini-3.8-flash-high", "low"), ("gemini-3.8-flash-low", "low"))
 
-        # Claude models: agy rejects --effort for them, so no effort is reported
-        # and the client must never append the flag (it would kill the worker).
-        # Issue #15.
-        self.assertEqual(client._resolve_model_and_effort("claude-sonnet-4-6", "high"), ("claude-sonnet-4-6", None))
-        self.assertEqual(client._resolve_model_and_effort("claude-opus-4-6-thinking", "medium"), ("claude-opus-4-6-thinking", None))
+        # Claude Sonnet 4.6 and Opus 4.6 are selected by bare name, without --effort.
+        self.assertEqual(client._resolve_model_and_effort("claude-sonnet-4-6", "low"), ("claude-sonnet-4-6", None))
+        self.assertEqual(client._resolve_model_and_effort("claude-sonnet-4-6", "medium"), ("claude-sonnet-4-6", None))
+        self.assertEqual(client._resolve_model_and_effort("claude-opus-4-6-thinking", "high"), ("claude-opus-4-6-thinking", None))
+
+        # Phantom/legacy 5-5 requests alias safely to 4-6 without --effort.
+        self.assertEqual(client._resolve_model_and_effort("claude-sonnet-5-5", "low"), ("claude-sonnet-4-6", None))
+        self.assertEqual(client._resolve_model_and_effort("claude-opus-5-5", "high"), ("claude-opus-4-6-thinking", None))
+
+        # Aliases dynamically resolve against available catalog (5.5 with effort vs 4.6 without effort)
+        catalog_5_5 = {
+            "gemini-3.8-flash": ("low", "medium", "high"),
+            "claude-sonnet-5-5": ("low", "medium", "high"),
+            "claude-opus-5-5": ("low", "medium", "high"),
+        }
+        with patch("models._catalog_cache", (time.monotonic() + 60, catalog_5_5)):
+            self.assertEqual(client._resolve_model_and_effort("sonnet", "high"), ("claude-sonnet-5-5-high", "high"))
+            self.assertEqual(client._resolve_model_and_effort("opus", "medium"), ("claude-opus-5-5-medium", "medium"))
+
+        catalog_4_6 = {
+            "gemini-3.8-flash": ("low", "medium", "high"),
+            "claude-sonnet-4-6": (),
+            "claude-opus-4-6-thinking": (),
+        }
+        with patch("models._catalog_cache", (time.monotonic() + 60, catalog_4_6)):
+            self.assertEqual(client._resolve_model_and_effort("sonnet", "high"), ("claude-sonnet-4-6", None))
+            self.assertEqual(client._resolve_model_and_effort("opus", "medium"), ("claude-opus-4-6-thinking", None))
+
+        # gpt-oss-120b only exists at medium: every request maps to it.
+        for requested in ("low", "medium", "high", "max"):
+            self.assertEqual(client._resolve_model_and_effort("gpt-oss-120b", requested), ("gpt-oss-120b-medium", "medium"))
+        self.assertEqual(client._resolve_model_and_effort("gpt-oss-120b-medium", "low"), ("gpt-oss-120b-medium", "medium"))
+
+        # A model that neither agy nor the built-in table lists is selected by
+        # bare name, without --effort (agy rejects it for those). Issue #15.
+        with patch("models._catalog_cache", None), patch("models.load_catalog", return_value={}):
+            self.assertEqual(client._resolve_model_and_effort("claude-sonnet-4-6", "high"), ("claude-sonnet-4-6", None))
+            self.assertEqual(client._resolve_model_and_effort("claude-opus-4-6-thinking", "medium"), ("claude-opus-4-6-thinking", None))
 
     def test_profile_supported_reasoning_efforts(self):
+        import models
+
         profile = get_provider_profile("antigravity-subscription-directsdk")
+        prov_models = sys.modules.get(f"{type(profile).__module__}.models", models)
         self.assertEqual(profile.supported_reasoning_efforts("gemini-3.8-flash"), ("low", "medium", "high"))
         self.assertEqual(profile.supported_reasoning_efforts("gemini-3.1-pro"), ("low", "high"))
-        self.assertEqual(profile.supported_reasoning_efforts("gpt-oss-120b-medium"), ())
-        # agy rejects --effort for Claude; offering levels would break every turn.
-        # Issue #15.
         self.assertEqual(profile.supported_reasoning_efforts("claude-sonnet-4-6"), ())
         self.assertEqual(profile.supported_reasoning_efforts("claude-opus-4-6-thinking"), ())
+        self.assertEqual(profile.supported_reasoning_efforts("claude-sonnet-5-5"), ())
+        self.assertEqual(profile.supported_reasoning_efforts("gpt-oss-120b-medium"), ("medium",))
+        # Aliases resolve to the model they stand for in the catalog.
+        self.assertEqual(profile.supported_reasoning_efforts("pro"), ("low", "high"))
+        catalog_5_5 = {
+            "claude-sonnet-5-5": ("low", "medium", "high"),
+            "claude-opus-5-5": ("low", "medium", "high"),
+        }
+        with patch.object(prov_models, "_catalog_cache", (time.monotonic() + 60, catalog_5_5)), \
+             patch("models._catalog_cache", (time.monotonic() + 60, catalog_5_5)):
+            self.assertEqual(profile.supported_reasoning_efforts("sonnet"), ("low", "medium", "high"))
+            self.assertEqual(profile.supported_reasoning_efforts("opus"), ("low", "medium", "high"))
+        catalog_4_6 = {
+            "claude-sonnet-4-6": (),
+            "claude-opus-4-6-thinking": (),
+        }
+        with patch.object(prov_models, "_catalog_cache", (time.monotonic() + 60, catalog_4_6)), \
+             patch("models._catalog_cache", (time.monotonic() + 60, catalog_4_6)):
+            self.assertEqual(profile.supported_reasoning_efforts("sonnet"), ())
+            self.assertEqual(profile.supported_reasoning_efforts("opus"), ())
+        # Unknown bare-name models take no --effort; offering levels would
+        # break every turn. Issue #15.
+        with patch.object(prov_models, "_catalog_cache", None), \
+             patch("models._catalog_cache", None):
+            self.assertEqual(profile.supported_reasoning_efforts("claude-sonnet-4-6"), ())
+            self.assertEqual(profile.supported_reasoning_efforts("claude-opus-4-6-thinking"), ())
+
+    AGY_MODELS_OUTPUT = (
+        "Fetching available models...\n"
+        "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n"
+        "gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\n"
+        "gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n"
+        "gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n"
+        "gemini-3.1-pro-low\tGemini 3.1 Pro (Low)\n"
+        "claude-opus-5-5-low\tClaude Opus 5.5 (Low)\n"
+        "claude-opus-5-5-medium\tClaude Opus 5.5 (Medium)\n"
+        "claude-opus-5-5-high\tClaude Opus 5.5 (High)\n"
+        "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n"
+        "claude-legacy\tClaude Legacy\n"
+    )
+
+    def test_parse_catalog_groups_efforts_per_model(self):
+        import models
+
+        catalog = models.parse_catalog(self.AGY_MODELS_OUTPUT)
+        self.assertEqual(
+            catalog,
+            {
+                "gemini-3.8-flash": ("low", "medium", "high"),
+                "gemini-3.1-pro": ("low", "high"),
+                "claude-opus-5-5": ("low", "medium", "high"),
+                "gpt-oss-120b": ("medium",),
+                "claude-legacy": (),
+            },
+        )
+        self.assertEqual(list(catalog)[0], "gemini-3.8-flash")
+
+    def test_parse_catalog_accepts_custom_and_arbitrary_models(self):
+        import models
+
+        raw_output = (
+            "⠋ Fetching available models...\n"
+            "error: ignored warning\n"
+            "deepseek-r1-high\tDeepSeek R1 (High)\n"
+            "deepseek-r1-low\tDeepSeek R1 (Low)\n"
+            "qwen-2.5-coder-32b\tQwen 2.5 Coder 32B\n"
+            "custom-finetune-medium\tCustom Fine-tune (Medium)\n"
+        )
+        catalog = models.parse_catalog(raw_output)
+        self.assertEqual(
+            catalog,
+            {
+                "deepseek-r1": ("low", "high"),
+                "qwen-2.5-coder-32b": (),
+                "custom-finetune": ("medium",),
+            },
+        )
+
+    def test_dynamic_alias_precedence_with_claude_5_5(self):
+        import models
+
+        catalog = {
+            "gemini-3.8-flash": ("low", "medium", "high"),
+            "claude-sonnet-5-5": ("low", "medium", "high"),
+            "claude-sonnet-4-6": (),
+            "claude-opus-5-5": ("low", "high"),
+        }
+        # When catalog has 5-5, alias 'sonnet' dynamically maps to newest (5-5)
+        self.assertEqual(models.resolve_model_alias("sonnet", catalog), "claude-sonnet-5-5")
+        self.assertEqual(models.resolve_model_alias("claude-sonnet", catalog), "claude-sonnet-5-5")
+        self.assertEqual(models.resolve_model_alias("claude-sonnet-5-5", catalog), "claude-sonnet-5-5")
+        self.assertEqual(models.resolve_model_alias("opus", catalog), "claude-opus-5-5")
+
+    def test_profile_fallback_models_is_empty_for_account_scoping(self):
+        profile = get_provider_profile("antigravity-subscription-directsdk")
+        self.assertEqual(profile.fallback_models, ())
+
+    def test_fetch_models_lists_every_family_once(self):
+        import models
+
+        profile = get_provider_profile("antigravity-subscription-directsdk")
+        listed = SimpleNamespace(stdout=self.AGY_MODELS_OUTPUT)
+        with patch("models._catalog_cache", None), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run", return_value=listed):
+            result = profile.fetch_models()
+        self.assertEqual(
+            result,
+            ["gemini-3.8-flash", "gemini-3.1-pro", "claude-opus-5-5", "gpt-oss-120b", "claude-legacy"],
+        )
+
+    def test_fetch_models_falls_back_when_agy_fails(self):
+        import models
+
+        profile = get_provider_profile("antigravity-subscription-directsdk")
+        with patch("models._catalog_cache", None), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run", side_effect=FileNotFoundError("agy")):
+            self.assertEqual(profile.fetch_models(), list(models._FALLBACK_MODELS))
+
+    def test_live_catalog_overrides_builtin_efforts(self):
+        import models
+
+        live = {"gemini-3.1-pro": ("low", "medium", "high")}
+        with patch("models._catalog_cache", (time.monotonic() + 60, live)):
+            self.assertEqual(
+                models.resolve_model_and_effort("gemini-3.1-pro", "medium"),
+                ("gemini-3.1-pro-medium", "medium"),
+            )
+
+    def test_unknown_model_is_looked_up_once_in_the_catalog(self):
+        import models
+
+        live = {"claude-next-9": ("low", "high")}
+        with patch("models._catalog_cache", None), \
+                patch("models.load_catalog", return_value=live) as load:
+            self.assertEqual(models.model_efforts("claude-next-9"), ("low", "high"))
+            # load_catalog is mocked, so it leaves the cache empty: refresh=False
+            # finds neither a cache nor a built-in entry.
+            self.assertEqual(models.model_efforts("claude-next-9", refresh=False), None)
+            load.assert_called_once()
+
+    def test_failed_catalog_lookup_is_not_retried_immediately(self):
+        import models
+
+        with patch("models._catalog_cache", None), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run", side_effect=FileNotFoundError("agy")) as run:
+            self.assertIsNone(models.model_efforts("mystery-model"))
+            self.assertIsNone(models.model_efforts("another-mystery"))
+        self.assertEqual(run.call_count, 1)
+
+    def test_concurrent_lookups_spawn_agy_once(self):
+        import threading
+        import models
+
+        def slow_run(*args, **kwargs):
+            time.sleep(0.2)
+            return SimpleNamespace(stdout="mystery-model-low\nmystery-model-high\n")
+
+        results = []
+        with patch("models._catalog_cache", None), \
+                patch("process.resolve_agy_command", return_value="agy"), \
+                patch("models.subprocess.run", side_effect=slow_run) as run:
+            threads = [
+                threading.Thread(target=lambda: results.append(models.model_efforts("mystery-model")))
+                for _ in range(4)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(results, [("low", "high")] * 4)
+
+    def test_aliases_point_at_known_models(self):
+        import models
+
+        for alias, target in models._MODEL_ALIASES.items():
+            # An alias may pin an effort (gemini-max -> gemini-3.8-flash-high): its base must be known.
+            self.assertIn(models.split_effort_suffix(target)[0], models._KNOWN_EFFORTS, alias)
 
     def test_fetch_models_clean_base_names(self):
         profile = get_provider_profile("antigravity-subscription-directsdk")
@@ -657,29 +886,40 @@ class AntigravityPluginTests(unittest.TestCase):
         profile = get_provider_profile("antigravity-subscription-directsdk")
         plugin_mod = sys.modules[type(profile).__module__]
         accounts_mod = sys.modules[plugin_mod.list_accounts.__module__]
-        listing = {
-            None: ("gemini-3.8-flash-high", "claude-opus-5-5-medium", "claude-sonnet-5-5-medium"),
-            "/acc/a": ("gemini-3.8-flash-high", "claude-sonnet-4-6"),
+        host = {
+            "gemini-3.8-flash": ("low", "medium", "high"),
+            "claude-opus-5-5": ("medium",),
+            "claude-sonnet-5-5": ("medium",),
         }
+        listing = {"/acc/a": ("gemini-3.8-flash-high", "claude-sonnet-4-6")}
         accounts = [{"home_dir": "/acc/a", "enabled": True}, {"home_dir": "/acc/off", "enabled": False}]
         with patch.object(plugin_mod, "list_accounts", return_value=accounts), \
+                patch.object(plugin_mod, "load_catalog", return_value=host), \
                 patch.object(accounts_mod, "list_models_for_home",
                              side_effect=lambda home, timeout=15.0: listing.get(home, ())):
             models = profile.fetch_models()
-        self.assertEqual(
-            models,
-            ["gemini-3.8-flash", "claude-opus-5-5-medium", "claude-sonnet-5-5-medium", "claude-sonnet-4-6"],
-        )
+        # Host catalog first, then whatever a usable rotation account adds.
+        self.assertEqual(models, ["gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5", "claude-sonnet-4-6"])
 
     def test_profile_get_model_context_length(self):
         profile = get_provider_profile("antigravity-subscription-directsdk")
-        self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 200_000)
-        self.assertEqual(profile.get_model_context_length("gemini-3.1-pro"), 200_000)
-        self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 200_000)
+        self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 239_000)
+        self.assertEqual(profile.get_model_context_length("gemini-3.1-pro"), 239_000)
+        self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 239_000)
 
-        # Test env override
+        # Test env overrides
         with patch.dict(os.environ, {"ANTIGRAVITY_CONTEXT_LENGTH": "250000"}):
             self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 250_000)
+
+        with patch.dict(os.environ, {"HERMES_ANTIGRAVITY_CONTEXT_LENGTH": "120000"}):
+            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 120_000)
+
+        # HERMES_ takes precedence over ANTIGRAVITY_
+        with patch.dict(os.environ, {
+            "HERMES_ANTIGRAVITY_CONTEXT_LENGTH": "110000",
+            "ANTIGRAVITY_CONTEXT_LENGTH": "90000",
+        }):
+            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 110_000)
 
     def test_profile_classify_api_error(self):
         profile = get_provider_profile("antigravity-subscription-directsdk")
@@ -695,13 +935,48 @@ class AntigravityPluginTests(unittest.TestCase):
         verdict2 = hook(RuntimeError("Antigravity execution failed: empty result (status='SUCCESS')"))
         self.assertEqual(verdict2, {"reason": "context_overflow", "retryable": True, "should_compress": True})
 
-        # Test context canceled
+        # Test Go stream cancellation / context canceled is NOT context_overflow
         verdict3 = hook(RuntimeError("stream input cancelled: context canceled"))
-        self.assertEqual(verdict3, {"reason": "context_overflow", "retryable": True, "should_compress": True})
+        self.assertIsNone(verdict3)
+
+        # Test max trajectory tokens
+        verdict_traj = hook(RuntimeError("max_trajectory_tokens exceeded"))
+        self.assertEqual(verdict_traj, {"reason": "context_overflow", "retryable": True, "should_compress": True})
+
+        # Test AI credits balance exhaustion (billing)
+        verdict_billing = hook(RuntimeError("Antigravity execution failed: Your AI credits balance is too low to continue."))
+        self.assertEqual(
+            verdict_billing,
+            {"reason": "billing", "retryable": False, "should_fallback": True, "should_compress": False},
+        )
+
+        # Test daily or billing cap (billing)
+        verdict_cap = hook(RuntimeError("Antigravity model error: daily or billing cap reached"))
+        self.assertEqual(
+            verdict_cap,
+            {"reason": "billing", "retryable": False, "should_fallback": True, "should_compress": False},
+        )
+
+        # Test account verification required (auth_permanent)
+        verdict_verify = hook(RuntimeError("Verify your account to continue: https://g.co/verify"))
+        self.assertEqual(
+            verdict_verify,
+            {"reason": "auth_permanent", "retryable": False, "should_fallback": False, "should_compress": False},
+        )
+
+        # Test terms of service appeal required (auth_permanent)
+        verdict_tos = hook(RuntimeError("Appeal a terms of service block at https://support.google.com/appeal"))
+        self.assertEqual(
+            verdict_tos,
+            {"reason": "auth_permanent", "retryable": False, "should_fallback": False, "should_compress": False},
+        )
 
         # Test unrelated error returns None
         verdict4 = hook(RuntimeError("Invalid API key or unauthorized"))
         self.assertIsNone(verdict4)
+
+        # Test unsupported_response_formats on profile
+        self.assertEqual(profile.unsupported_response_formats, ("json_schema",))
 
     def test_hermes_error_classifier_integration(self):
         try:
@@ -714,6 +989,29 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertEqual(classified.reason, FailoverReason.context_overflow)
         self.assertTrue(classified.retryable)
         self.assertTrue(classified.should_compress)
+
+        # Test billing classification via Hermes error classifier
+        err_billing = RuntimeError("Antigravity execution failed: Your AI credits balance is too low to continue.")
+        classified_billing = classify_api_error(err_billing, provider="antigravity-subscription-directsdk")
+        self.assertEqual(classified_billing.reason, FailoverReason.billing)
+        self.assertFalse(classified_billing.retryable)
+        self.assertTrue(classified_billing.should_fallback)
+
+        # Test auth_permanent classification via Hermes error classifier
+        err_auth = RuntimeError("Verify your account to continue at https://g.co/verify")
+        classified_auth = classify_api_error(err_auth, provider="antigravity-subscription-directsdk")
+        self.assertEqual(classified_auth.reason, FailoverReason.auth_permanent)
+        self.assertFalse(classified_auth.retryable)
+        self.assertFalse(classified_auth.should_fallback)
+
+        # Test headless unprompted tool denial and context cancellation does NOT classify as context_overflow
+        err_headless = RuntimeError(
+            "Antigravity execution failed: jetski: no output produced — a tool required the 'command' permission "
+            "that headless mode cannot prompt for, so it was auto-denied.\nerror: stream input cancelled: context canceled"
+        )
+        classified_headless = classify_api_error(err_headless, provider="antigravity-subscription-directsdk")
+        self.assertNotEqual(classified_headless.reason, FailoverReason.context_overflow)
+        self.assertFalse(classified_headless.should_compress)
 
     def test_security_default_args_omit_dangerous_permissions(self):
         # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
@@ -882,11 +1180,123 @@ class AntigravityPluginTests(unittest.TestCase):
             stream2 = client.chat.completions.create(model="gemini-3.8-flash", messages=msgs2, stream=True)
             list(stream2)
             self.assertEqual(len(client._worker_history), 2)
-            # Proc was not terminated between turns
-            mock_proc.terminate.assert_not_called()
+            # Verify conversation_id was captured
+            self.assertEqual(client._worker_conversation_id, "conv-worker")
 
         client.close()
         mock_proc.terminate.assert_called()
+
+    def test_worker_conversation_resumed_with_flag_after_process_death(self):
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+
+        def make_proc(conv_id, resp):
+            proc = MagicMock()
+            proc.poll.return_value = None
+            proc.stdin = MagicMock()
+            events = [
+                json.dumps({"event": "init", "conversation_id": conv_id}) + "\n",
+                json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": resp, "usage": {}}}) + "\n",
+            ]
+            def rl():
+                yield from events
+                while True:
+                    yield ""
+            proc.stdout.readline.side_effect = rl()
+            return proc
+
+        proc1 = make_proc("conv-persistent-42", "turn 1 done")
+        proc2 = make_proc("conv-persistent-42", "turn 2 done")
+
+        worker_spawns = []
+
+        def mock_popen(cmd_args, **kwargs):
+            if "models" in cmd_args:
+                m = MagicMock()
+                m.communicate.return_value = ("Gemini 3.8 Flash (High)\n", "")
+                m.returncode = 0
+                return m
+            worker_spawns.append(list(cmd_args))
+            return proc1 if len(worker_spawns) == 1 else proc2
+
+        with patch("subprocess.Popen", side_effect=mock_popen):
+            # Turn 1
+            msgs1 = [{"role": "user", "content": "turn 1"}]
+            stream1 = client.chat.completions.create(model="gemini-3.8-flash", messages=msgs1, stream=True)
+            list(stream1)
+            self.assertEqual(client._worker_conversation_id, "conv-persistent-42")
+            # First spawn should NOT have --conversation
+            self.assertNotIn("--conversation", worker_spawns[0])
+
+            # Simulate worker process dying or reaped while keeping conversation
+            client._terminate_worker(keep_conversation=True)
+            self.assertIsNone(client._worker_proc)
+            self.assertEqual(client._worker_conversation_id, "conv-persistent-42")
+
+            # Turn 2: continuation of history
+            msgs2 = msgs1 + [{"role": "tool", "tool_call_id": "call_1", "content": "result 1"}]
+            stream2 = client.chat.completions.create(model="gemini-3.8-flash", messages=msgs2, stream=True)
+            list(stream2)
+
+            # Second spawn MUST include --conversation conv-persistent-42
+            self.assertEqual(len(worker_spawns), 2)
+            self.assertIn("--conversation", worker_spawns[1])
+            conv_idx = worker_spawns[1].index("--conversation")
+            self.assertEqual(worker_spawns[1][conv_idx + 1], "conv-persistent-42")
+
+        client.close()
+
+    def test_worker_conversation_reset_on_new_session(self):
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+
+        def make_proc(conv_id, resp):
+            proc = MagicMock()
+            proc.poll.return_value = None
+            proc.stdin = MagicMock()
+            events = [
+                json.dumps({"event": "init", "conversation_id": conv_id}) + "\n",
+                json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": resp, "usage": {}}}) + "\n",
+            ]
+            def rl():
+                yield from events
+                while True:
+                    yield ""
+            proc.stdout.readline.side_effect = rl()
+            return proc
+
+        proc1 = make_proc("conv-alpha", "resp 1")
+        proc2 = make_proc("conv-beta", "resp 2")
+
+        worker_spawns = []
+
+        def mock_popen(cmd_args, **kwargs):
+            if "models" in cmd_args:
+                m = MagicMock()
+                m.communicate.return_value = ("Gemini 3.8 Flash (High)\n", "")
+                m.returncode = 0
+                return m
+            worker_spawns.append(list(cmd_args))
+            return proc1 if len(worker_spawns) == 1 else proc2
+
+        with patch("subprocess.Popen", side_effect=mock_popen):
+            # Session 1: Turn 1
+            msgs1 = [{"role": "user", "content": "session 1"}]
+            list(client.chat.completions.create(model="gemini-3.8-flash", messages=msgs1, stream=True))
+            self.assertEqual(client._worker_conversation_id, "conv-alpha")
+
+            # Session 2: Fresh prompt (not a continuation of msgs1, e.g. /new)
+            msgs2 = [{"role": "user", "content": "session 2 starting over"}]
+            list(client.chat.completions.create(model="gemini-3.8-flash", messages=msgs2, stream=True))
+
+            # Must NOT pass old conversation id to new session
+            self.assertEqual(len(worker_spawns), 2)
+            self.assertNotIn("--conversation", worker_spawns[1])
+            self.assertEqual(client._worker_conversation_id, "conv-beta")
+
+        client.close()
 
     @staticmethod
     def _scripted_proc(events: list[str], *, alive: bool) -> MagicMock:
@@ -1821,6 +2231,18 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertIn("Resets in 1h49m22s.", err)
             self.assertNotIn("retrying in", err)
 
+            # Verify AI credits balance exhaustion log line
+            log_file.write_text("E1008 06:00:00.000000 100 run.go:100] Your AI credits balance is too low to continue.\n", encoding="utf-8")
+            err_credits = _check_early_quota_error(tmp_path)
+            self.assertIsNotNone(err_credits)
+            self.assertIn("Your AI credits balance is too low to continue.", err_credits)
+
+            # Verify daily or billing cap log line
+            log_file.write_text("E1008 06:00:00.000000 100 run.go:100] Request halted: daily or billing cap reached\n", encoding="utf-8")
+            err_cap = _check_early_quota_error(tmp_path)
+            self.assertIsNotNone(err_cap)
+            self.assertIn("daily or billing cap reached", err_cap)
+
             # Check min_mtime filter: future timestamp ignores old log
             err_future = _check_early_quota_error(tmp_path, min_mtime=time.time() + 100)
             self.assertIsNone(err_future)
@@ -1867,6 +2289,32 @@ class AntigravityPluginTests(unittest.TestCase):
             self.assertIn("RESOURCE_EXHAUSTED", str(ctx.exception))
             self.assertIn("Individual quota reached", str(ctx.exception))
             mock_client._terminate_process.assert_called_with(mock_proc)
+
+    def test_worker_nonzero_exit_propagates_stderr(self):
+        mock_proc = MagicMock()
+        mock_proc.stdout.readline.return_value = ""
+        mock_proc.poll.return_value = 1
+        mock_proc._stderr_drainer = MagicMock()
+        mock_proc._stderr_drainer.get_tail.return_value = "Your AI credits balance is too low to continue."
+
+        mock_client = MagicMock()
+        mock_client._isolated_gemini_dir = None
+        mock_lock = threading.Lock()
+
+        stream = AntigravityStream(
+            proc=mock_proc,
+            client=mock_client,
+            model="gemini-3.8-flash",
+            timeout=5.0,
+            is_worker=True,
+            worker_lock=mock_lock,
+            worker_lock_held=False,
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            list(stream)
+
+        self.assertIn("Your AI credits balance is too low to continue.", str(ctx.exception))
 
 
 if __name__ == "__main__":
