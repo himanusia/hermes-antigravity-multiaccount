@@ -140,3 +140,43 @@ class WorkerIdleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConversationAccountGuardTests(WorkerIdleTests):
+    """agy keeps its conversation database under each account's HOME, so a
+    conversation may only be resumed by the account that started it."""
+
+    class _Stop(Exception):
+        pass
+
+    def _spawn_args(self, home_dir, label):
+        history = [{"role": "user", "content": "first"}]
+        self.client._conversation_history = list(history)
+        self.client._worker_conversation_id = "conv-1"
+        self.client._conversation_account = ("/acc/a", "a")
+        seen = {}
+
+        def fake_spawn(model, effort, home_dir=None, account_label=None, conversation_id=None):
+            seen.update(home_dir=home_dir, account_label=account_label, conversation_id=conversation_id)
+            raise self._Stop
+
+        messages = history + [{"role": "assistant", "content": "ok"}, {"role": "user", "content": "next"}]
+        with patch.object(self.client, "_get_or_spawn_worker", side_effect=fake_spawn), \
+                patch.object(self.client, "_purge_isolated_conversations"):
+            with self.assertRaises(self._Stop):
+                self.client._execute_chat_completion(
+                    resolved_model="gemini-3.8-flash", effort=None, messages_list=messages,
+                    effective_timeout=5.0, tools=None, tool_choice=None, stream=False,
+                    home_dir=home_dir, account_label=label,
+                )
+        return seen
+
+    def test_same_account_resumes_the_conversation(self):
+        seen = self._spawn_args("/acc/a", "a")
+        self.assertEqual(seen["conversation_id"], "conv-1")
+        self.assertEqual((seen["home_dir"], seen["account_label"]), ("/acc/a", "a"))
+
+    def test_other_account_starts_a_fresh_conversation(self):
+        seen = self._spawn_args("/acc/b", "b")
+        self.assertIsNone(seen["conversation_id"])
+        self.assertEqual((seen["home_dir"], seen["account_label"]), ("/acc/b", "b"))
