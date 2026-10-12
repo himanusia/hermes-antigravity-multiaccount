@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ try:
         STATE_OK,
         STATE_NEEDS_LOGIN,
         STATE_NOT_ELIGIBLE,
+        STATE_UNKNOWN,
         extract_email_from_token_file,
         fetch_usage_for_home,
         find_account_token_path,
@@ -46,6 +48,7 @@ except ImportError:
         STATE_OK,
         STATE_NEEDS_LOGIN,
         STATE_NOT_ELIGIBLE,
+        STATE_UNKNOWN,
         extract_email_from_token_file,
         fetch_usage_for_home,
         find_account_token_path,
@@ -92,6 +95,16 @@ logger = logging.getLogger(__name__)
 
 # An interactive sign-in that never returns must not hang the CLI forever.
 _LOGIN_TIMEOUT_SECONDS = 600.0
+
+# Sign-in without the interactive TUI. A one-word print-mode turn with no saved session makes agy run
+# its Google OAuth flow first (browser, or a pasted code over SSH), then answer and exit by itself,
+# so nobody has to type /exit. `/usage` cannot do this: it is read-only and never starts a login.
+_LOGIN_PROMPT = "Reply with exactly: OK"
+_LOGIN_PRINT_TIMEOUT = "9m"  # below _LOGIN_TIMEOUT_SECONDS so agy gives up before the hard cap
+
+
+def _login_command(agy: str) -> list[str]:
+    return [agy, "-p", _LOGIN_PROMPT, "--print-timeout", _LOGIN_PRINT_TIMEOUT]
 
 def _rotation_accounts() -> list[dict[str, Any]]:
     """Registered accounts that can serve a request (enabled and eligible)."""
@@ -320,6 +333,17 @@ def _shorten_home(path_str: str) -> str:
     return str(path_str)
 
 
+def _print_refresh_hint(states: dict[str, str]) -> None:
+    """Say which accounts still cannot serve requests and what fixes each one."""
+    for label, state in states.items():
+        if state == STATE_NEEDS_LOGIN:
+            print(f"  {label}: signed out. Run `hermes auth add antigravity-subscription-directsdk --label {label}`.")
+        elif state == STATE_NOT_ELIGIBLE:
+            print(f"  {label}: not eligible for Antigravity. Finish the account's verification in a browser, then refresh again.")
+        elif state == STATE_UNKNOWN:
+            print(f"  {label}: could not be verified (agy gave no usable answer).")
+
+
 def antigravity_auth_handler(action: str, args: Any) -> bool:
     """Provider-owned auth handler for `hermes auth add|status|logout|refresh`.
 
@@ -363,8 +387,9 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
         env["HOME"] = str(home_dir)
         env.pop("ANTIGRAVITY_CONFIG_DIR", None)
 
-        print(f"Opening agy in {home_dir} for Antigravity sign-in...")
-        print("Please complete the sign-in prompt in your browser if requested.")
+        print(f"Starting Google sign-in through agy for {home_dir} ...")
+        print("A browser window opens; over SSH, open the printed URL and paste the code back here.")
+        print("agy exits on its own once signed in. You do not need to type /exit.")
         print(
             "Note: On macOS, if a dialog appears saying 'a keychain cannot be found to store \"antigravity\"', "
             "you can safely click Cancel. Authentication tokens are stored directly in account files."
@@ -374,7 +399,11 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
         # Output stays inherited so the browser prompt remains visible; the timeout
         # only stops a sign-in that never finishes from hanging the CLI forever.
         try:
-            login_proc = subprocess.run([cmd], env=env, check=False, timeout=_LOGIN_TIMEOUT_SECONDS)
+            # Private cwd: agy must not adopt the caller's repository as its workspace.
+            with tempfile.TemporaryDirectory(prefix="hermes-agy-login-") as login_cwd:
+                login_proc = subprocess.run(
+                    _login_command(cmd), env=env, cwd=login_cwd, check=False, timeout=_LOGIN_TIMEOUT_SECONDS
+                )
         except subprocess.TimeoutExpired:
             if is_staging:
                 shutil.rmtree(home_dir, ignore_errors=True)
@@ -422,9 +451,14 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
         )
         record_account_state(final_label or extracted_email or final_home.name, probed_state)
 
-        print(f"Successfully saved account '{final_label or extracted_email or final_home.name}' to registry.")
+        shown = final_label or extracted_email or final_home.name
+        print(f"Successfully saved account '{shown}' to registry.")
         if probed_state == STATE_NEEDS_LOGIN:
             print("WARNING: login did not complete; run `hermes auth add antigravity-subscription-directsdk` again.")
+            print("WARNING: the account stays registered but is skipped by rotation until it signs in.")
+        elif probed_state == STATE_UNKNOWN:
+            print("NOTE: could not verify this account (agy gave no usable answer).")
+            print(f"NOTE: it stays registered; check it later with `hermes auth status antigravity-subscription-directsdk`.")
         if is_eligible:
             # Eligible accounts stay quiet: no warning, just the current quota.
             if usage_data:
@@ -439,6 +473,8 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
         else:
             print("WARNING: this account is NOT eligible for the Antigravity subscription.")
             print("WARNING: it stays registered but quota rotation will skip it.")
+            print("  To fix it, open Antigravity with that Google account in a browser and finish its")
+            print("  verification or terms prompts, then run `hermes auth refresh antigravity-subscription-directsdk` to re-check it.")
 
         return True
 
@@ -597,19 +633,25 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
             if target not in accounts:
                 raise SystemExit(f"Error: Account '{target}' not found in registry.")
             set_cooldown(target, until=0.0)
-            fetch_usage_for_home(accounts[target].get("home_dir", ""), cached=False)
-            print(f"Cleared cooldown and refreshed quota for '{target}'.")
+            state, _ = probe_account_state(accounts[target].get("home_dir", ""))
+            record_account_state(target, state)
+            print(f"Cleared cooldown and refreshed quota for '{target}' (state: {state}).")
+            _print_refresh_hint({target: state})
             return True
 
         accounts = list_accounts()
         if not accounts:
             print("No Antigravity accounts registered.")
             return True
+        states: dict[str, str] = {}
         for acc in accounts:
             lbl = acc["label"]
             set_cooldown(lbl, until=0.0)
-            fetch_usage_for_home(acc.get("home_dir", ""), cached=False)
+            state, _ = probe_account_state(acc.get("home_dir", ""))
+            record_account_state(lbl, state)
+            states[lbl] = state
         print(f"Cleared cooldowns and refreshed quota for {len(accounts)} account(s).")
+        _print_refresh_hint(states)
         return True
 
     if action == "use":
