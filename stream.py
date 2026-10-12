@@ -15,9 +15,11 @@ from types import SimpleNamespace
 from typing import Any, Iterator, NamedTuple
 
 try:
+    from . import native_tools as _native_tools
     from .process import _check_early_quota_error
     from .prompt import _longest_tool_call_prefix_match, _parse_tool_block
 except ImportError:
+    import native_tools as _native_tools
     from process import _check_early_quota_error
     from prompt import _longest_tool_call_prefix_match, _parse_tool_block
 
@@ -173,6 +175,7 @@ class AntigravityStream(Iterator[Any]):
         self.model = model
         self.timeout = timeout
         self.has_tools = bool(tools)
+        self.tool_names = _native_tools.tool_names(tools)
         self.is_worker = is_worker
         self.worker_lock = worker_lock
         self.messages = messages
@@ -640,6 +643,18 @@ class AntigravityStream(Iterator[Any]):
                     if step.get("step_type") == "tool" and self._is_attached_image_view(step):
                         continue
                     if step.get("step_type") == "tool":
+                        # Re-issue a mappable native step as the equivalent Hermes tool call, so
+                        # Hermes' own approval/sandbox layer runs it. Anything else is neutralized.
+                        call = None if has_tool_calls else _native_tools.translate(step, self.tool_names, index=0)
+                        if call is not None:
+                            logger.info("Antigravity native tool '%s' re-issued as Hermes tool '%s'.",
+                                        step.get("tool_name"), call.function.name)
+                            has_tool_calls = True
+                            text_buffer = ""
+                            yield self._make_chunk(tool_calls=[call])
+                            self.close()
+                            neutralized_tool_step = True
+                            break
                         logger.warning(
                             "Antigravity attempted native tool invocation '%s'; neutralizing to prevent host execution.",
                             step.get("tool_name"),

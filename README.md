@@ -296,3 +296,8 @@ PYTHONPATH=/usr/local/lib/hermes-agent:. pytest
 ## License
 
 MIT
+
+## Native tool bridge and workspace rules
+
+- **Native tool bridge.** When a model ignores the `<tool_call>` protocol and calls an agy built-in, the plugin no longer drops the turn. It kills the agy step and re-issues it as the matching Hermes tool, so Hermes' approvals and sandbox run it: `run_command`→`terminal`, `view_file`→`read_file`, `write_to_file`→`write_file`, `grep_search`/`find_by_name`→`search_files`, `search_web`→`web_search`, `read_url_content`→`web_extract`. It only maps to tools present in the request; any other native step is still neutralized. (`native_tools.py`, idea from neerazz/hermes-antigravity-oauth, MIT.)
+- **SOUL.md as workspace rules.** When a fresh agy session starts, the plugin writes `$HERMES_HOME/SOUL.md` (if Hermes left it out), the Hermes system prompt and the tool contract to `GEMINI.md` in agy's workspace, which agy loads as first-class rules. The stdin prompt then carries only tools and conversation. Rules are written before the spawn and never mid-session. Set `ANTIGRAVITY_WORKSPACE_RULES=0` to inline everything in the prompt again. One-shot calls always inline. (`soul.py`)

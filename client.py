@@ -84,6 +84,7 @@ try:
         update_last_used,
     )
     from .debug import dump_prompt_debug
+    from . import soul as _soul
 except ImportError:
     from models import (
         _FALLBACK_MODELS,
@@ -140,6 +141,7 @@ except ImportError:
         update_last_used,
     )
     from debug import dump_prompt_debug
+    import soul as _soul
 
 logger = logging.getLogger(__name__)
 
@@ -801,6 +803,23 @@ class AntigravityClient:
             self._conversation_history = []
             self._conversation_account = None
 
+    def _write_workspace_rules(self, messages: list[dict[str, Any]]) -> bool:
+        """Write SOUL.md + the Hermes system prompt to the workspace GEMINI.md that agy loads as rules.
+
+        Called only when a fresh worker session is about to start (agy reads rules at session start),
+        so a system prompt that drifts mid-session never churns the running worker. Returns True
+        when the rules are in the workspace, so the prompt can omit them; False means inline them.
+        """
+        if not _soul.rules_enabled():
+            return False
+        rules = _soul.build_rules(_soul.system_parts_of(messages, _render_message_content), _PROMPT_PREAMBLE)
+        try:
+            _soul.write_rules(self._cwd, rules)
+        except OSError as exc:
+            logger.warning("Antigravity: could not write workspace rules (%s); inlining them", exc)
+            return False
+        return True
+
     def _terminate_worker(self, keep_conversation: bool = False) -> None:
         with self._lock:
             self._terminate_worker_locked(keep_conversation=keep_conversation)
@@ -1035,11 +1054,14 @@ class AntigravityClient:
                         if self._worker_proc is not None or self._worker_conversation_id:
                             self._terminate_worker_locked(keep_conversation=False)
                             self._purge_isolated_conversations()
+                    # agy reads GEMINI.md when the session starts: write it before the spawn.
+                    rules = self._write_workspace_rules(messages_list)
                     proc = self._get_or_spawn_worker(
                         resolved_model, effort, home_dir=home_dir, account_label=account_label, conversation_id=None
                     )
                     prompt_payload = _format_messages_as_prompt(
-                        messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice
+                        messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice,
+                        rules_in_workspace=rules,
                     )
                     dump_prompt_debug(
                         prompt=prompt_payload,
@@ -1057,11 +1079,14 @@ class AntigravityClient:
                     with self._lock:
                         self._terminate_worker_locked(keep_conversation=False)
                         self._purge_isolated_conversations()
+                    # agy reads GEMINI.md when the session starts: write it before the spawn.
+                    rules = self._write_workspace_rules(messages_list)
                     proc = self._get_or_spawn_worker(
                         resolved_model, effort, home_dir=home_dir, account_label=account_label, conversation_id=None
                     )
                     prompt_payload = _format_messages_as_prompt(
-                        messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice
+                        messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice,
+                        rules_in_workspace=rules,
                     )
                     dump_prompt_debug(
                         prompt=prompt_payload,
