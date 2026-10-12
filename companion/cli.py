@@ -1,0 +1,373 @@
+"""CLI surface for the Antigravity companion plugin: `hermes antigravity ...`.
+
+The provider plugin (`antigravity-subscription-directsdk`) is a
+``kind: model-provider`` plugin, and Hermes never calls ``register(ctx)`` on that
+kind, so it cannot offer a CLI command. This companion plugin is a normal
+standalone plugin, so it can. It only reads the same on-disk contract.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+try:
+    from . import accounts
+except ImportError:  # loaded as a top-level module
+    import accounts  # type: ignore[no-redef]
+
+
+def register_cli(subparser: argparse.ArgumentParser) -> None:
+    """Wire `hermes antigravity <action>` into the Hermes CLI."""
+    subs = subparser.add_subparsers(dest="antigravity_action")
+
+    p_list = subs.add_parser("list", help="List Antigravity accounts with eligibility and quota")
+    p_list.add_argument("--fast", action="store_true", help="Skip quota probes (no agy calls)")
+
+    p_run = subs.add_parser("run", help="Run the agy CLI as a stored account (interactive by default)")
+    p_run.add_argument("label", help="Account ID or label, or 'host' for the original HOME")
+    p_run.add_argument("agy_args", nargs=argparse.REMAINDER, help="Arguments passed through to agy")
+
+    p_usage = subs.add_parser("usage", help="Show remaining quota for one account")
+    p_usage.add_argument("label", nargs="?", default=accounts.HOST_LABEL, help="Account ID or label (default: host)")
+
+    p_use = subs.add_parser("use", help="Switch the active account in the registry")
+    p_use.add_argument("label", help="Account ID or label, or 'host' to return to the host default")
+
+    p_add = subs.add_parser("add", help="Sign in a new Google account and register it")
+    p_add.add_argument("--label", default="", help="Optional label (defaults to the account email)")
+
+    p_remove = subs.add_parser("remove", help="Unregister an account and move its home directory to the Trash")
+    p_remove.add_argument("label", help="Account ID or label (see `hermes antigravity list`)")
+    p_remove.add_argument("--keep-home", action="store_true", help="Only unregister; leave the home directory on disk")
+
+    p_mode = subs.add_parser("mode", help="Show or set the rotation mode")
+    p_mode.add_argument(
+        "mode",
+        nargs="?",
+        choices=("",) + accounts.ROTATION_MODES,
+        help="off | quota | round_robin | fixed (omit to show the current one)",
+    )
+
+    p_ignite = subs.add_parser("ignite", help="Show or toggle quota ignition for idle 5h windows")
+    p_ignite.add_argument("state", nargs="?", choices=("on", "off", "status"), help="Omit to show the current state")
+
+    subparser.set_defaults(func=antigravity_command)
+
+
+def antigravity_command(args: argparse.Namespace) -> int:
+    action = getattr(args, "antigravity_action", None)
+    if not action:
+        print("Usage: hermes antigravity {list|run|usage|use|add|remove|mode|ignite}")
+        return 2
+    if action == "list":
+        return _cmd_list(fast=bool(getattr(args, "fast", False)))
+    if action == "run":
+        return _cmd_run(str(getattr(args, "label", "")), list(getattr(args, "agy_args", []) or []))
+    if action == "usage":
+        return _cmd_usage(str(getattr(args, "label", accounts.HOST_LABEL) or accounts.HOST_LABEL))
+    if action == "use":
+        return _cmd_use(str(getattr(args, "label", "")))
+    if action == "add":
+        return _cmd_add(str(getattr(args, "label", "") or ""))
+    if action == "remove":
+        return _cmd_remove(str(getattr(args, "label", "") or ""), bool(getattr(args, "keep_home", False)))
+    if action == "mode":
+        return _cmd_mode(str(getattr(args, "mode", "") or ""))
+    if action == "ignite":
+        return _cmd_ignite(str(getattr(args, "state", "") or ""))
+    print(f"Unknown antigravity action: {action}")
+    return 2
+
+
+def _cmd_list(fast: bool) -> int:
+    active = accounts.active_store_name()
+    header: list[str] = ["ID", "ACCOUNT", "EMAIL", "ELIGIBLE", "GEMINI 5h/wk", "CLAUDE+GPT 5h/wk", "RESET", "HOME"]
+    rows: list[list[str]] = [header]
+    ineligible: list[str] = []
+
+    for account in accounts.list_accounts():
+        is_active = (
+            str(account["label"]) == active
+            if active
+            else bool(account.get("host"))
+        )
+        home_text = str(account["home"])
+        short_home = "~/" + home_text.split("/.agy-accounts/")[-1] if "/.agy-accounts/" in home_text else home_text
+        if fast:
+            eligible_value = account.get("eligible")
+            if eligible_value is False:
+                eligible_text = "NO"
+                ineligible.append(_account_ref(account))
+            elif eligible_value is True:
+                eligible_text = "yes"
+            else:
+                eligible_text = "-"
+            quota_gemini = quota_claude = reset_text = "-"
+        else:
+            eligible, windows, note, resets = accounts.probe(account["home"])
+            if eligible is True:
+                eligible_text = "yes"
+            elif eligible is False:
+                eligible_text = "NO"
+                ineligible.append(_account_ref(account))
+            else:
+                eligible_text = f"? ({note})" if note else "?"
+            quota_gemini = accounts.window_pair(windows, "gemini")
+            quota_claude = accounts.window_pair(windows, "claude_gpt")
+            reset_text = accounts.next_reset(resets)
+        mark = "*" if is_active else " "
+        account_id = account.get("id")
+        label = str(account["label"])
+        email = str(account["email"] or "")
+        rows.append(
+            [
+                f"{mark}{account_id if account_id is not None else '-'}",
+                label,
+                # The label is usually the email itself; do not print it twice.
+                "" if email in ("", label) else email,
+                eligible_text,
+                quota_gemini,
+                quota_claude,
+                reset_text,
+                short_home,
+            ]
+        )
+
+    if all(not row[2] for row in rows[1:]):
+        rows = [row[:2] + row[3:] for row in rows]
+    _print_table(
+        rows,
+        fit=(("drop", "HOME"), ("shrink", "EMAIL"), ("drop", "EMAIL"), ("shrink", "ACCOUNT"), ("drop", "RESET")),
+    )
+
+    # Warn only about accounts that cannot be used; eligible accounts stay quiet.
+    if ineligible:
+        print(f"\nWARNING: not eligible for Antigravity (skipped by quota rotation): {', '.join(ineligible)}")
+
+    print("\n<account> is an ID (e.g. 3) or a label.")
+    print("Run an account:   hermes antigravity run <account>")
+    print("Add an account:   hermes antigravity add [--label <name>]")
+    print("One-shot:         hermes antigravity run <account> -p \"...\"")
+    print("Quota:            hermes antigravity usage [account]")
+    print("Switch account:   hermes antigravity use <account>")
+    print("Rotation:         hermes antigravity mode [mode]     # off | quota | round_robin | fixed")
+    print("Idle wake-up:     hermes antigravity ignite [on|off]")
+    print("Remove account:   hermes antigravity remove <account> [--keep-home]")
+    return 0
+
+
+def _unknown_account(label: str) -> int:
+    print(f"Unknown account '{label}'. Run `hermes antigravity list` to see accounts.")
+    return 2
+
+
+def _cmd_run(label: str, agy_args: list[str]) -> int:
+    account = accounts.resolve_account(label)
+    if account is None:
+        return _unknown_account(label)
+    if agy_args and agy_args[0] == "--":
+        agy_args = agy_args[1:]
+    return accounts.run_agy(account["home"], agy_args)
+
+
+def _cmd_usage(label: str) -> int:
+    account = accounts.resolve_account(label)
+    if account is None:
+        return _unknown_account(label)
+
+    eligible, windows, note, resets = accounts.probe(account["home"])
+    print(f"Account:  {account['label']}")
+    if account["email"]:
+        print(f"Email:    {account['email']}")
+    print(f"Home:     {account['home']}")
+
+    if eligible is False:
+        print("Eligible: NO")
+        print(f"\nWARNING: not eligible for Antigravity: {note or 'subscription check failed'}")
+        return 1
+    if eligible is None:
+        print(f"Eligible: unknown ({note or 'could not determine'})")
+        return 1
+
+    print("Eligible: yes")
+    print(f"  Gemini     5h {accounts.pct(windows.get('gemini_5h'))}   weekly {accounts.pct(windows.get('gemini_weekly'))}")
+    print(f"  Claude/GPT 5h {accounts.pct(windows.get('claude_gpt_5h'))}   weekly {accounts.pct(windows.get('claude_gpt_weekly'))}")
+    resets_note = accounts.reset_note(resets)
+    if resets_note:
+        print(f"  {resets_note}")
+    return 0
+
+
+def _cmd_use(label: str) -> int:
+    wanted = (label or "").strip()
+    if not wanted:
+        print("Usage: hermes antigravity use <id|label>   ('host' returns to the host default)")
+        return 2
+    if wanted == accounts.HOST_LABEL:
+        accounts.set_active_label(None)
+        registry = accounts.load_registry()
+        current = accounts.active_store_name(registry)
+        if current:
+            print(f"Active account: {current}")
+        else:
+            print("Active account: none (host default)")
+        return 0
+    account = accounts.resolve_account(wanted)
+    if account is None:
+        return _unknown_account(wanted)
+    accounts.set_active_label(str(account["label"]))
+    print(f"Active account: {account['label']}")
+    return 0
+
+
+def _cmd_remove(label: str, keep_home: bool) -> int:
+    wanted = (label or "").strip()
+    if not wanted:
+        print("Usage: hermes antigravity remove <id|label> [--keep-home]")
+        return 2
+    if wanted == accounts.HOST_LABEL:
+        print("The host account is your real HOME login and cannot be removed here.")
+        return 2
+    account = accounts.resolve_account(wanted)
+    if account is None:
+        return _unknown_account(wanted)
+    label = str(account["label"])
+    # An open Hermes session may still run agy as this account; left alone it keeps
+    # refreshing the token and recreates the directory after it is moved away.
+    stopped = accounts.stop_account_processes(account["home"])
+    removed, moved = accounts.remove_account(label, keep_home=keep_home)
+    ref = _account_ref(account)
+    print(f"Removed {ref} from the registry." if removed else f"{ref} was not in the registry.")
+    if stopped:
+        print(f"Stopped {len(stopped)} agy process(es) still using it: {', '.join(map(str, stopped))}")
+    if moved is not None:
+        print(f"Home directory moved to {moved}" if moved.exists() else f"Home directory deleted: {moved}")
+    elif keep_home:
+        print(f"Home directory kept at {account['home']} (`list` will still show it as unregistered).")
+    return 0
+
+
+def _cmd_add(label: str) -> int:
+    """Register a new account by delegating to the provider's official sign-in flow.
+
+    The sign-in (Google OAuth, token file persistence, eligibility check) lives in
+    the provider plugin's `auth_handler`, reached through `hermes auth add`. We only
+    forward the call so there is a single implementation, and so credentials are
+    never touched by this plugin.
+    """
+    if not sys.stdin.isatty():
+        print("`hermes antigravity add` needs an interactive terminal (it opens the Google sign-in).")
+        print("Run it from your terminal, or directly:")
+        print("  hermes auth add antigravity-subscription-directsdk --label <name>")
+        return 2
+    exe = shutil.which("hermes") or "hermes"
+    cmd = [exe, "auth", "add", "antigravity-subscription-directsdk"]
+    wanted = (label or "").strip()
+    if wanted:
+        cmd += ["--label", wanted]
+    print(f"Signing in a new account{' as ' + wanted if wanted else ''}...")
+    return subprocess.call(cmd)
+
+
+def _cmd_mode(mode: str) -> int:
+    wanted = (mode or "").strip().lower()
+    if wanted and wanted not in accounts.ROTATION_MODES:
+        print(f"Invalid mode '{mode}'. Valid modes: {', '.join(accounts.ROTATION_MODES)}")
+        return 2
+    if wanted:
+        accounts.save_rotation_mode(wanted)
+    registry = accounts.load_registry()
+    current = str(registry.get("rotation_mode") or "").strip().lower()
+    origin = "registry"
+    if not current:
+        env_raw = os.environ.get("ANTIGRAVITY_ROTATION_MODE", "")
+        current, origin = env_raw.strip().lower(), "env"
+    if not current:
+        current, origin = "off", "default"
+    print(f"Rotation mode: {current} ({origin})")
+    print(f"Effect: {accounts.describe_rotation_mode(current) or 'unknown mode'}")
+    return 0
+
+
+def _cmd_ignite(state: str) -> int:
+    raw = os.environ.get("ANTIGRAVITY_QUOTA_IGNITION", "").strip().lower()
+    env_enabled = raw in ("1", "true", "yes", "on")
+    registry = accounts.load_registry()
+    stored = registry.get("quota_ignition")
+
+    if state and state != "status":
+        enabled = state == "on"
+        accounts.save_quota_ignition(enabled)
+        origin = "registry"
+    else:
+        if isinstance(stored, bool):
+            enabled, origin = stored, "registry"
+        else:
+            enabled, origin = env_enabled, "env" if raw else "default"
+    print(f"Quota ignition: {'on' if enabled else 'off'} ({origin})")
+    print(f"Effect: {accounts.ignite_effect(enabled)}")
+    return 0
+
+
+def _account_ref(account: dict) -> str:
+    account_id = account.get("id")
+    return f"#{account_id} {account['label']}" if account_id is not None else str(account["label"])
+
+
+def _clip(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
+
+
+def _print_table(
+    rows: list[list[str]],
+    fit: tuple[tuple[str, str], ...] = (),
+    width: int | None = None,
+) -> None:
+    """Print rows as columns that fit the terminal.
+
+    `fit` lists ("drop", header) / ("shrink", header) steps, applied in order only
+    while the table is still too wide; "shrink" clips a column (with an ellipsis)
+    down to 12 characters. A pipe or file (no terminal) gets the full table.
+    """
+    if not rows:
+        return
+    gap = 2
+    if width is None:
+        width = shutil.get_terminal_size((0, 0)).columns if sys.stdout.isatty() else 0
+    rows = [list(row) for row in rows]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+
+    def over() -> int:
+        return sum(widths) + gap * (len(widths) - 1) - width
+
+    for step, name in fit if width > 0 else ():
+        if over() <= 0:
+            break
+        if name not in rows[0]:
+            continue
+        index = rows[0].index(name)
+        if step == "drop":
+            rows = [row[:index] + row[index + 1 :] for row in rows]
+            del widths[index]
+        else:
+            widths[index] -= min(over(), max(widths[index] - max(12, len(name)), 0))
+
+    for index, row in enumerate(rows):
+        print("  ".join(_clip(cell, widths[i]).ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+        if index == 0:
+            print("  ".join("-" * w for w in widths))
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Direct entry point, useful for local testing without the Hermes CLI."""
+    parser = argparse.ArgumentParser(prog="hermes antigravity")
+    register_cli(parser)
+    return antigravity_command(parser.parse_args(argv if argv is not None else sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

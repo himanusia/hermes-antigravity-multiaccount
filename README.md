@@ -8,16 +8,26 @@ Hermes Agent model provider that routes inference through an active Google Antig
 
 This plugin lets Hermes use Gemini and Claude models through your existing Antigravity quota.
 
+> **This is a maintained fork** of [soyelmismo/hermes-antigravity-subscription](https://github.com/soyelmismo/hermes-antigravity-subscription) (MIT). It tracks upstream and adds:
+>
+> | Addition | What it does |
+> | :--- | :--- |
+> | Multi-account rotation | Register several Google accounts, each in its own HOME. `quota`, `round_robin` or `off` modes, cooldown on 429, skip of ineligible or logged-out accounts. |
+> | Quota in `/usage` | Per-account 5-hour and weekly remaining quota from `agy -p "/usage"`, which spends no tokens. |
+> | `hermes antigravity ...` CLI | `list`, `run`, `usage`, `use`, `add`, `remove`, `mode`, `ignite` (companion plugin in [`companion/`](companion)). |
+> | Native tool bridge | A model that calls agy's built-in tools gets them re-issued as Hermes tools instead of losing the turn. |
+> | SOUL.md as rules | Your Hermes persona is delivered to agy as workspace `GEMINI.md`. |
+
 ---
 
 ## How It Works
 
 - **Token streaming**: Reads stdout chunks from `agy --output-format stream-json` and yields standard completion deltas.
 - **Tool call routing**: The model emits `<tool_call>` tags in text. The plugin parses these into OpenAI function call deltas, so Hermes executes tools on the host instead of `agy`.
-- **Tool execution guard**: `agy` registers local system tools by default. This plugin runs `agy` in headless mode without permissions skip flags. If `agy` attempts to execute an internal tool step, the stream closes and terminates the child process.
+- **Tool execution guard**: `agy` registers local system tools by default. This plugin runs `agy` in headless mode without permissions skip flags. If `agy` attempts to execute an internal tool step, the stream closes and terminates the child process; steps that map to a Hermes tool are re-issued as that tool call (see *Native tool bridge*).
 - **Thinking effort mapping**: Maps Hermes reasoning effort settings (`low`, `medium`, `high`) to backend model variants (`gemini-3.8-flash-low`, `gemini-3.8-flash-high`).
 - **Subagent concurrency**: Each completion turn runs in its own process group (`start_new_session=True`). Multiple Hermes subagents can request completions concurrently without shared state.
-- **Filesystem isolation**: Subprocesses run in an isolated, private temporary working directory per client and slash commands are disabled. Local `GEMINI.md` and `AGENTS.md` project files are not read.
+- **Filesystem isolation**: Subprocesses run in an isolated, private temporary working directory per client and slash commands are disabled. Project `AGENTS.md` files are not read. The only `GEMINI.md` agy sees is the one this plugin writes into that directory (see *Native tool bridge and workspace rules*).
 - **Tool output pruning**: Old tool results (diffs, directory trees, test output) dominate wire payload in long sessions. The prompt builder keeps the last 8 tool results intact and caps older tool outputs at 300 characters. A 20k character safety limit with head/tail preservation guards individual tool calls. In a 336-message session, this cut wire payload from 600 KB to 180 KB (70% reduction).
 - **Error classification and recovery**: `classify_api_error` detects `agy` PubSub stalls (`subscriber fell behind updates, stalled for 5s`), trajectory limits, and empty SUCCESS status (returning `context_overflow` with `should_compress: True`). It classifies credit balance exhaustion and billing caps as `billing` for immediate failover, and maps account verification and Terms of Service notices to `auth_permanent` to surface resolution links without retry loops.
 
@@ -180,17 +190,24 @@ Strict baseline: `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TERM`, `TMPDIR`/`TEM
 Install through the Hermes plugin manager:
 
 ```bash
-hermes plugins install https://github.com/soyelmismo/hermes-antigravity-subscription
+hermes plugins install https://github.com/himanusia/hermes-antigravity-subscription
 hermes plugins enable antigravity-subscription-directsdk
 ```
 
 Or clone into the local plugins folder:
 
 ```bash
-git clone https://github.com/soyelmismo/hermes-antigravity-subscription.git \
+git clone https://github.com/himanusia/hermes-antigravity-subscription.git \
   ~/.hermes/plugins/antigravity-subscription-directsdk
 
 hermes plugins enable antigravity-subscription-directsdk
+```
+
+Optional CLI companion (`hermes antigravity ...`). It is a second plugin because Hermes never calls `register(ctx)` on `kind: model-provider` plugins:
+
+```bash
+cp -r ~/.hermes/plugins/antigravity-subscription-directsdk/companion ~/.hermes/plugins/antigravity-companion
+hermes plugins enable antigravity-companion
 ```
 
 > **Directory naming tip**: Hermes Agent discovers plugins by scanning directories in `~/.hermes/plugins/` alphabetically. If you keep backup copies (such as `antigravity-subscription-directsdk.backup`), place them outside `~/.hermes/plugins/` so a later-sorting directory does not override the active plugin.
@@ -281,6 +298,11 @@ If an account encounters a quota error (HTTP 429 / resource exhausted), it is pl
 
 Account credentials are stored under `~/.agy-accounts/<label>/` and the registry file is stored at `~/.hermes/antigravity-accounts.json` (configurable via `ANTIGRAVITY_ACCOUNTS_DIR` and `ANTIGRAVITY_ACCOUNTS_FILE`).
 
+### Native tool bridge and workspace rules
+
+- **Native tool bridge.** When a model ignores the `<tool_call>` protocol and calls an agy built-in, the plugin no longer drops the turn. It kills the agy step and re-issues it as the matching Hermes tool, so Hermes' approvals and sandbox run it: `run_command`→`terminal`, `view_file`→`read_file`, `write_to_file`→`write_file`, `grep_search`/`find_by_name`→`search_files`, `search_web`→`web_search`, `read_url_content`→`web_extract`. It only maps to tools present in the request; any other native step is still neutralized. (`native_tools.py`, idea from neerazz/hermes-antigravity-oauth, MIT.)
+- **SOUL.md as workspace rules.** When a fresh agy session starts, the plugin writes `$HERMES_HOME/SOUL.md` (if Hermes left it out), the Hermes system prompt and the tool contract to `GEMINI.md` in agy's workspace, which agy loads as first-class rules. The stdin prompt then carries only tools and conversation. Rules are written before the spawn and never mid-session. Set `ANTIGRAVITY_WORKSPACE_RULES=0` to inline everything in the prompt again. One-shot calls always inline. (`soul.py`)
+
 ---
 
 ## Tests
@@ -295,9 +317,4 @@ PYTHONPATH=/usr/local/lib/hermes-agent:. pytest
 
 ## License
 
-MIT
-
-## Native tool bridge and workspace rules
-
-- **Native tool bridge.** When a model ignores the `<tool_call>` protocol and calls an agy built-in, the plugin no longer drops the turn. It kills the agy step and re-issues it as the matching Hermes tool, so Hermes' approvals and sandbox run it: `run_command`→`terminal`, `view_file`→`read_file`, `write_to_file`→`write_file`, `grep_search`/`find_by_name`→`search_files`, `search_web`→`web_search`, `read_url_content`→`web_extract`. It only maps to tools present in the request; any other native step is still neutralized. (`native_tools.py`, idea from neerazz/hermes-antigravity-oauth, MIT.)
-- **SOUL.md as workspace rules.** When a fresh agy session starts, the plugin writes `$HERMES_HOME/SOUL.md` (if Hermes left it out), the Hermes system prompt and the tool contract to `GEMINI.md` in agy's workspace, which agy loads as first-class rules. The stdin prompt then carries only tools and conversation. Rules are written before the spawn and never mid-session. Set `ANTIGRAVITY_WORKSPACE_RULES=0` to inline everything in the prompt again. One-shot calls always inline. (`soul.py`)
+MIT. Original work (c) soyelmismo; fork additions (c) himanusia. See [LICENSE](LICENSE).
