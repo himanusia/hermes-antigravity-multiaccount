@@ -83,11 +83,22 @@ def antigravity_command(args: argparse.Namespace) -> int:
     return 2
 
 
+def _print_verify_link(ref: str, home: str | None) -> None:
+    """Show the Google verification link from the latest probe, if agy printed one."""
+    url = accounts.verify_url(home) if home else None
+    if url:
+        print(f"  {ref}: open this link signed in as that Google account to verify it:")
+        print(f"    {url}")
+    elif home:
+        print(f"  {ref}: no link from agy; run `hermes antigravity usage {ref}` to fetch a fresh one.")
+
+
 def _cmd_list(fast: bool) -> int:
     active = accounts.active_store_name()
     header: list[str] = ["ID", "ACCOUNT", "EMAIL", "ELIGIBLE", "GEMINI 5h/wk", "CLAUDE+GPT 5h/wk", "RESET", "HOME"]
     rows: list[list[str]] = [header]
     ineligible: list[str] = []
+    ineligible_homes: dict[str, str] = {}
 
     for account in accounts.list_accounts():
         is_active = (
@@ -114,6 +125,7 @@ def _cmd_list(fast: bool) -> int:
             elif eligible is False:
                 eligible_text = "NO"
                 ineligible.append(_account_ref(account))
+                ineligible_homes[_account_ref(account)] = str(account["home"])
             else:
                 eligible_text = f"? ({note})" if note else "?"
             quota_gemini = accounts.window_pair(windows, "gemini")
@@ -147,6 +159,8 @@ def _cmd_list(fast: bool) -> int:
     # Warn only about accounts that cannot be used; eligible accounts stay quiet.
     if ineligible:
         print(f"\nWARNING: not eligible for Antigravity (skipped by quota rotation): {', '.join(ineligible)}")
+        for ref in ineligible:
+            _print_verify_link(ref, ineligible_homes.get(ref))
 
     print("\n<account> is an ID (e.g. 3) or a label.")
     print("Run an account:   hermes antigravity run <account>")
@@ -188,6 +202,7 @@ def _cmd_usage(label: str) -> int:
     if eligible is False:
         print("Eligible: NO")
         print(f"\nWARNING: not eligible for Antigravity: {note or 'subscription check failed'}")
+        _print_verify_link(str(account["label"]), str(account["home"]))
         return 1
     if eligible is None:
         print(f"Eligible: unknown ({note or 'could not determine'})")

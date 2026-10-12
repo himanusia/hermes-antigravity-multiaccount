@@ -94,6 +94,14 @@ class ProbeTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertIn("not eligible", note)
 
+    def test_probe_ineligible_keeps_the_verification_link(self):
+        out = ("error: Eligibility check failed: not eligible.\nPlease verify your account in your browser to continue:\n"
+               "https://accounts.google.com/signin/continue?sarp=1\n")
+        with self._run(stdout="", stderr=out):
+            eligible, *_ = accounts.probe(Path.home())
+        self.assertFalse(eligible)
+        self.assertEqual(accounts.verify_url(Path.home()), "https://accounts.google.com/signin/continue?sarp=1")
+
     def test_probe_not_signed_in(self):
         with self._run(stdout="Please sign in to view available models."):
             eligible, _, note, _ = accounts.probe(Path.home())

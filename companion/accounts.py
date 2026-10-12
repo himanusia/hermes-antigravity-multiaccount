@@ -199,6 +199,23 @@ def account_env(home: Path | str) -> dict[str, str]:
     return env
 
 
+VERIFY_URLS: dict[str, str] = {}  # in memory only: agy mints a fresh link per probe
+
+
+def extract_verify_url(text: str) -> str | None:
+    """The browser verification link agy prints for a not-eligible account, if any."""
+    low = text.lower()
+    anchor = low.find("verify your account in your browser")
+    if anchor == -1:
+        anchor = low.find("in your browser")
+    m = re.search(r"https://[^\s<>\"']+", text[max(anchor, 0):])
+    return m.group(0).rstrip(".,);") if m else None
+
+
+def verify_url(home: Path | str) -> str | None:
+    return VERIFY_URLS.get(str(Path(home).expanduser().resolve()))
+
+
 def probe(home: Path | str) -> tuple[bool | None, dict[str, float | None], str, dict[str, float]]:
     """(eligible, windows, note, reset_times). eligible is None when it cannot be determined."""
     env = account_env(home)
@@ -218,6 +235,12 @@ def probe(home: Path | str) -> tuple[bool | None, dict[str, float | None], str, 
     stdout = (result.stdout or "").strip()
     blob = f"{stdout}\n{result.stderr or ''}".lower()
     if "not eligible" in blob:
+        url = extract_verify_url(f"{result.stdout or ''}\n{result.stderr or ''}")
+        key = str(Path(home).expanduser().resolve())
+        if url:
+            VERIFY_URLS[key] = url
+        else:
+            VERIFY_URLS.pop(key, None)
         return False, {}, "not eligible for Antigravity", {}
     if "sign in" in blob:
         return None, {}, "not signed in", {}

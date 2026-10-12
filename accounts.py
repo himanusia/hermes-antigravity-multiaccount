@@ -304,6 +304,27 @@ def classify_probe_output(stdout: str, stderr: str, returncode: int) -> str:
     return STATE_UNKNOWN
 
 
+_VERIFY_URL_RE = re.compile(r"https://[^\s<>\"']+")
+# Fresh link per probe, kept in memory only: agy mints it per request and it carries a sign-in
+# continuation, so it is shown when asked for and never written to the registry.
+_VERIFY_URLS: dict[str, str] = {}
+
+
+def extract_verify_url(text: str) -> str | None:
+    """The browser verification link agy prints for a not-eligible account, if any."""
+    low = text.lower()
+    anchor = low.find("verify your account in your browser")
+    if anchor == -1:
+        anchor = low.find("in your browser")
+    m = _VERIFY_URL_RE.search(text, max(anchor, 0))
+    return m.group(0).rstrip(".,);") if m else None
+
+
+def get_verify_url(home_dir: str | Path) -> str | None:
+    """Link from the latest probe of this account, or None when it was not not-eligible."""
+    return _VERIFY_URLS.get(str(Path(home_dir).expanduser().resolve()))
+
+
 def probe_account_state(home_dir: str | Path, timeout: float = 30.0) -> tuple[str, dict[str, Any] | None]:
     """Read-only state of one account: (state, usage). Never starts a login."""
     norm_home = str(Path(home_dir).expanduser().resolve())
@@ -319,6 +340,11 @@ def probe_account_state(home_dir: str | Path, timeout: float = 30.0) -> tuple[st
         return STATE_UNKNOWN, None
     state = classify_probe_output(res.stdout or "", res.stderr or "", res.returncode)
     usage = _parse_usage_json(res.stdout) if state == STATE_OK else None
+    url = extract_verify_url(f"{res.stdout}\n{res.stderr}") if state == STATE_NOT_ELIGIBLE else None
+    if url:
+        _VERIFY_URLS[norm_home] = url
+    else:
+        _VERIFY_URLS.pop(norm_home, None)
     if usage is not None:
         with _USAGE_CACHE_LOCK:
             _USAGE_CACHE[norm_home] = (time.monotonic(), usage)

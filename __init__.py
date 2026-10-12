@@ -19,6 +19,7 @@ try:
         DEFAULT_ACCOUNTS_DIR,
         add_account,
         check_account_eligibility,
+        get_verify_url,
         probe_account_state,
         record_account_state,
         STATE_OK,
@@ -43,6 +44,7 @@ except ImportError:
         DEFAULT_ACCOUNTS_DIR,
         add_account,
         check_account_eligibility,
+        get_verify_url,
         probe_account_state,
         record_account_state,
         STATE_OK,
@@ -333,13 +335,24 @@ def _shorten_home(path_str: str) -> str:
     return str(path_str)
 
 
-def _print_refresh_hint(states: dict[str, str]) -> None:
+def _print_verify_link(home_dir: str, who: str, indent: str = "  ") -> None:
+    """Print the Google verification link for a not-eligible account, signed in as that account."""
+    url = get_verify_url(home_dir)
+    if url:
+        print(f"{indent}Open this link and sign in as {who} to verify the account:")
+        print(f"{indent}{url}")
+    else:
+        print(f"{indent}agy gave no verification link; open https://antigravity.google/ signed in as {who}.")
+
+
+def _print_refresh_hint(states: dict[str, str], homes: dict[str, str] | None = None) -> None:
     """Say which accounts still cannot serve requests and what fixes each one."""
     for label, state in states.items():
         if state == STATE_NEEDS_LOGIN:
             print(f"  {label}: signed out. Run `hermes auth add antigravity-subscription-directsdk --label {label}`.")
         elif state == STATE_NOT_ELIGIBLE:
-            print(f"  {label}: not eligible for Antigravity. Finish the account's verification in a browser, then refresh again.")
+            print(f"  {label}: not eligible for Antigravity. Verify it in a browser, then run refresh again.")
+            _print_verify_link((homes or {}).get(label, ""), label, indent="    ")
         elif state == STATE_UNKNOWN:
             print(f"  {label}: could not be verified (agy gave no usable answer).")
 
@@ -473,8 +486,8 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
         else:
             print("WARNING: this account is NOT eligible for the Antigravity subscription.")
             print("WARNING: it stays registered but quota rotation will skip it.")
-            print("  To fix it, open Antigravity with that Google account in a browser and finish its")
-            print("  verification or terms prompts, then run `hermes auth refresh antigravity-subscription-directsdk` to re-check it.")
+            print("  Verify it in a browser, then run `hermes auth refresh antigravity-subscription-directsdk` to re-check it.")
+            _print_verify_link(str(final_home), extracted_email or shown)
 
         return True
 
@@ -562,6 +575,12 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
             print("  Fix: hermes auth add antigravity-subscription-directsdk")
         if by_state.get(STATE_NOT_ELIGIBLE):
             print(f"\nWARNING: not eligible for Antigravity (skipped by rotation): {', '.join(by_state[STATE_NOT_ELIGIBLE])}")
+            print("  Verification links (sign in as the named account; each link comes from this check):")
+            for acc in list_accounts():
+                if acc.get("state") == STATE_NOT_ELIGIBLE:
+                    who = acc.get("email") or acc.get("label", "")
+                    print(f"  {acc.get('label', '')}:")
+                    _print_verify_link(acc.get("home_dir", ""), who, indent="    ")
 
         return True
 
@@ -636,7 +655,7 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
             state, _ = probe_account_state(accounts[target].get("home_dir", ""))
             record_account_state(target, state)
             print(f"Cleared cooldown and refreshed quota for '{target}' (state: {state}).")
-            _print_refresh_hint({target: state})
+            _print_refresh_hint({target: state}, {target: accounts[target].get("home_dir", "")})
             return True
 
         accounts = list_accounts()
@@ -644,14 +663,16 @@ def antigravity_auth_handler(action: str, args: Any) -> bool:
             print("No Antigravity accounts registered.")
             return True
         states: dict[str, str] = {}
+        homes: dict[str, str] = {}
         for acc in accounts:
             lbl = acc["label"]
+            homes[lbl] = acc.get("home_dir", "")
             set_cooldown(lbl, until=0.0)
             state, _ = probe_account_state(acc.get("home_dir", ""))
             record_account_state(lbl, state)
             states[lbl] = state
         print(f"Cleared cooldowns and refreshed quota for {len(accounts)} account(s).")
-        _print_refresh_hint(states)
+        _print_refresh_hint(states, homes)
         return True
 
     if action == "use":
