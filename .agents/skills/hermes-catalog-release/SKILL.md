@@ -69,8 +69,8 @@ git push origin vX.Y.Z
 ### Step 7: Verify the Release Build
 Wait for GitHub Actions to complete:
 ```bash
-gh run list --repo soyelmismo/hermes-antigravity-subscription -L 3
-gh run watch <run_id> --repo soyelmismo/hermes-antigravity-subscription
+gh run list --repo himanusia/hermes-antigravity-multiaccount -L 3
+gh run watch <run_id> --repo himanusia/hermes-antigravity-multiaccount
 ```
 Verify the published release:
 ```bash
@@ -165,7 +165,7 @@ Maintainers review catalog PRs in high volume. Apply these standards:
    - State measured reductions (e.g. "cuts wire payload from 600 KB to 180 KB").
 7. **Fully Qualified Issue and PR References:**
    - Never use bare issue numbers such as `#15` or `(#16)` in PR titles, bodies, or commit summaries. In `NousResearch/hermes-agent`, GitHub auto-links bare numbers to unrelated upstream issues.
-   - Always qualify references with the plugin repository: `soyelmismo/hermes-antigravity-subscription#15` or full issue URLs.
+   - Always qualify references with the plugin repository: `himanusia/hermes-antigravity-multiaccount#15` or full issue URLs.
 
 ### PR Body Template:
 
@@ -174,7 +174,7 @@ Follow-up to the catalogued plugin (owner-submitted pin bump, catalog rules 4 an
 
 Pin: <OLD_SHA> -> <NEW_SHA>
 Version: <OLD_VERSION> -> <NEW_VERSION>
-Release: https://github.com/soyelmismo/hermes-antigravity-subscription/releases/tag/v<NEW_VERSION>
+Release: https://github.com/himanusia/hermes-antigravity-multiaccount/releases/tag/v<NEW_VERSION>
 
 Commits adopted in range (`v<OLD_VERSION>..v<NEW_VERSION>`):
 

@@ -14,7 +14,7 @@ cannot register a CLI command. A normal plugin can.
 model-provider plugin). The companion is a subdirectory, so copy it in:
 
 ```sh
-git clone --depth 1 https://github.com/himanusia/hermes-antigravity-subscription /tmp/agy-plugin
+git clone --depth 1 https://github.com/himanusia/hermes-antigravity-multiaccount /tmp/agy-plugin
 cp -r /tmp/agy-plugin/companion ~/.hermes/plugins/antigravity-companion
 hermes plugins enable antigravity-companion
 ```

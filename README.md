@@ -8,15 +8,16 @@ Hermes Agent model provider that routes inference through an active Google Antig
 
 This plugin lets Hermes use Gemini and Claude models through your existing Antigravity quota.
 
-> **This is a maintained fork** of [soyelmismo/hermes-antigravity-subscription](https://github.com/soyelmismo/hermes-antigravity-subscription) (MIT). It tracks upstream and adds:
+> **Not a fork, a derivative.** This project started from [soyelmismo/hermes-antigravity-subscription](https://github.com/soyelmismo/hermes-antigravity-subscription) (streaming client, process isolation, keyring probes) and takes the native tool bridge and SOUL.md delivery from [neerazz/hermes-antigravity-oauth](https://github.com/neerazz/hermes-antigravity-oauth). Both are MIT. It has diverged enough to stand alone. What it adds:
 >
-> | Addition | What it does |
-> | :--- | :--- |
-> | Multi-account rotation | Register several Google accounts, each in its own HOME. `quota`, `round_robin` or `off` modes, cooldown on 429, skip of ineligible or logged-out accounts. |
-> | Quota in `/usage` | Per-account 5-hour and weekly remaining quota from `agy -p "/usage"`, which spends no tokens. |
-> | `hermes antigravity ...` CLI | `list`, `run`, `usage`, `use`, `add`, `remove`, `mode`, `ignite` (companion plugin in [`companion/`](companion)). |
-> | Native tool bridge | A model that calls agy's built-in tools gets them re-issued as Hermes tools instead of losing the turn. |
-> | SOUL.md as rules | Your Hermes persona is delivered to agy as workspace `GEMINI.md`. |
+> | Feature | What it does | Origin |
+> | :--- | :--- | :--- |
+> | Multi-account rotation | Register several Google accounts, each in its own HOME. `quota`, `round_robin` or `off` modes, cooldown on 429, skip of ineligible or logged-out accounts. | this repo |
+> | Quota in `/usage` | Per-account 5-hour and weekly remaining quota from `agy -p "/usage"`, which spends no tokens. | this repo |
+> | `hermes antigravity ...` CLI | `list`, `run`, `usage`, `use`, `add`, `remove`, `mode`, `ignite` (companion plugin in [`companion/`](companion)). | this repo |
+> | Native tool bridge | A model that calls agy's built-in tools gets them re-issued as Hermes tools instead of losing the turn. | neerazz, adapted |
+> | SOUL.md as rules | Your Hermes persona is delivered to agy as workspace `GEMINI.md`, written only when a session starts so rotation and resume stay intact. | neerazz, adapted |
+> | Core provider | Token streaming, tool-call parsing, worker reuse, model discovery. | soyelmismo |
 
 ---
 
@@ -190,14 +191,14 @@ Strict baseline: `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TERM`, `TMPDIR`/`TEM
 Install through the Hermes plugin manager:
 
 ```bash
-hermes plugins install https://github.com/himanusia/hermes-antigravity-subscription
+hermes plugins install https://github.com/himanusia/hermes-antigravity-multiaccount
 hermes plugins enable antigravity-subscription-directsdk
 ```
 
 Or clone into the local plugins folder:
 
 ```bash
-git clone https://github.com/himanusia/hermes-antigravity-subscription.git \
+git clone https://github.com/himanusia/hermes-antigravity-multiaccount.git \
   ~/.hermes/plugins/antigravity-subscription-directsdk
 
 hermes plugins enable antigravity-subscription-directsdk
@@ -317,4 +318,4 @@ PYTHONPATH=/usr/local/lib/hermes-agent:. pytest
 
 ## License
 
-MIT. Original work (c) soyelmismo; fork additions (c) himanusia. See [LICENSE](LICENSE).
+MIT. Copyright (c) soyelmismo, neerazz and himanusia. See [LICENSE](LICENSE).
