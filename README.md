@@ -15,6 +15,8 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 > | Multi-account rotation | Register several Google accounts, each in its own HOME. `quota`, `round_robin` or `off` modes, cooldown on 429, skip of ineligible or logged-out accounts. | this repo |
 > | Quota in `/usage` | Per-account 5-hour and weekly remaining quota from `agy -p "/usage"`, which spends no tokens. | this repo |
 > | `hermes antigravity ...` CLI | `list`, `run`, `usage`, `use`, `add`, `remove`, `mode`, `ignite` (companion plugin in [`companion/`](companion)). | this repo |
+| Image generation (`image_gen.provider: antigravity`) | agy's built-in `image-generator` subagent, served by the same multi-account rotation and failover as chat (companion plugin, [`companion/`](companion)). | this repo |
+| Speech-to-text (`stt.provider: antigravity`) | agy reads the audio and returns the transcript; same rotation (companion plugin). | this repo |
 > | Native tool bridge | A model that calls agy's built-in tools gets them re-issued as Hermes tools instead of losing the turn. | neerazz, adapted |
 > | SOUL.md as rules | Your Hermes persona is delivered to agy as workspace `GEMINI.md`, written only when a session starts so rotation and resume stay intact. | neerazz, adapted |
 > | Core provider | Token streaming, tool-call parsing, worker reuse, model discovery. | soyelmismo |
@@ -204,12 +206,24 @@ git clone https://github.com/himanusia/hermes-antigravity-multiaccount.git \
 hermes plugins enable antigravity-subscription-directsdk
 ```
 
-Optional CLI companion (`hermes antigravity ...`). It is a second plugin because Hermes never calls `register(ctx)` on `kind: model-provider` plugins:
+Optional companion plugin: the `hermes antigravity ...` CLI plus the `antigravity` image-generation and speech-to-text providers. It is a second plugin because Hermes never calls `register(ctx)` on `kind: model-provider` plugins:
 
 ```bash
 cp -r ~/.hermes/plugins/antigravity-subscription-directsdk/companion ~/.hermes/plugins/antigravity-companion
 hermes plugins enable antigravity-companion
 ```
+
+Then opt in to the media providers (nothing changes until you do):
+
+```yaml
+# ~/.hermes/config.yaml
+image_gen:
+  provider: antigravity   # ~20-120 s per image, spends Gemini quota
+stt:
+  provider: antigravity
+```
+
+Both pick the account exactly like chat does (`ANTIGRAVITY_ROTATION`, quota score, cooldown and failover on quota or sign-in errors). Pin one with `ANTIGRAVITY_MEDIA_ACCOUNT=<label>`. There is no text-to-speech: agy has none, and its `/voice` is TUI-only dictation.
 
 > **Directory naming tip**: Hermes Agent discovers plugins by scanning directories in `~/.hermes/plugins/` alphabetically. If you keep backup copies (such as `antigravity-subscription-directsdk.backup`), place them outside `~/.hermes/plugins/` so a later-sorting directory does not override the active plugin.
 
