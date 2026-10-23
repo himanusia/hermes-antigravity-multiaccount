@@ -2,8 +2,9 @@ name: Tests
 
 # PR / branch CI. release.yml is tag-only and never runs on branches, so
 # without this workflow a PR could merge code the release gate would reject.
-# This workflow runs the plugin test suite on every pull request and on
-# pushes to main, on Linux and Windows with Python 3.11.
+# This workflow runs the plugin test suite on every pull request and on every
+# branch push (work lands on a working branch long before main; an untested
+# branch is how a regression ships), on Linux and Windows with Python 3.11.
 #
 # Hermes is built from the upstream source at a pinned tag, NOT from PyPI:
 # the PyPI wheel lags (0.19.0) below the plugin's requires_hermes floor
@@ -20,8 +21,7 @@ name: Tests
 on:
   pull_request:
   push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
