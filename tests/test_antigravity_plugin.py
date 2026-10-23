@@ -878,7 +878,11 @@ class AntigravityPluginTests(unittest.TestCase):
 
     def test_fetch_models_clean_base_names(self):
         profile = get_provider_profile("antigravity-subscription-directsdk")
-        models = profile.fetch_models()
+        # Exercise the real catalog parser without consulting the host account.
+        with patch("models.subprocess.run", return_value=SimpleNamespace(stdout=(
+            "gemini-3.8-flash-high\ngemini-3.8-flash-medium\ngemini-3.1-pro-high\n"
+        ))):
+            models = profile.fetch_models()
         self.assertIsNotNone(models)
         # Verify deduplicated clean base names
         self.assertIn("gemini-3.8-flash", models)

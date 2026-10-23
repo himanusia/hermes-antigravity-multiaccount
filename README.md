@@ -54,6 +54,32 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 
 > **Trajectory Persistence & Context Length**: Multi-turn sessions persist across worker restarts via `agy --conversation <id>`, sending only incremental deltas on each turn. This bypasses `agy`'s single-turn 100,000-token prompt trimmer. The plugin declares 239,000 tokens to Hermes (configurable via `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` or `ANTIGRAVITY_CONTEXT_LENGTH`), ensuring Hermes auto-compaction triggers safely below `agy`'s internal checkpoint threshold (239,616 tokens / 256k - 16k output tokens) and preserves sovereign context control. Conversation databases are strictly isolated inside the worker's private temp directory and automatically purged on session resets (`/new`).
 
+### Prompt recovery and delivery diagnostics
+
+Tool-result turns restate the latest real user request in both full prompts and
+worker deltas. Empty-response recovery nudges remain in the transcript, but do not
+replace that request as the active objective. The provider recognizes the exact
+known core nudge when private message markers have been stripped by the transport.
+A new real user message still supersedes the previous objective.
+
+Output-token-limit errors are retryable server errors without context compression.
+Trajectory/context exhaustion continues to request compression.
+
+The delivery warning from `delivery.py` is a heuristic, not a delivery guarantee.
+It compares only fresh-context full sends on the same model/effort route. Worker
+deltas and concurrent oneshots are excluded because their character counts cannot
+be compared with whole-context usage. Cached input counts toward the diagnostic,
+without changing the usage reported to Hermes. Missing usage does not erase the
+previous valid sample. Set `ANTIGRAVITY_DISABLE_DELIVERY_WATCH=1` to disable it.
+
+Blind spots: the first request, stable-size truncation, and normal incremental tool
+loops. Changes in text density can still cause false positives. This warning does
+not prevent or repair the upstream tail truncation tracked in
+[issue 29](https://github.com/soyelmismo/hermes-antigravity-subscription/issues/29).
+Split large single-shot inputs or use a provider that delivers them intact.
+Reasoning text in `stream-json` remains blocked upstream: `agy` exposes no flag for it
+([issue 31](https://github.com/soyelmismo/hermes-antigravity-subscription/issues/31)).
+
 ### Model Compatibility
 
 `agy` embeds its own system prompt ("you are Antigravity, you have `run_command`, `view_file`, ...") before the plugin's preamble. Some models obey `agy`'s prompt over the plugin's `<tool_call>` protocol and invoke native tools, which headless mode soft-denies. The plugin detects this and terminates the stream, but the turn is lost.
@@ -264,7 +290,7 @@ The provider profile implements `fetch_account_usage()`, exposing subscription q
 
 Note: Custom plugin tools and slash commands are not available for `kind: model-provider` plugins because Hermes core skips calling `register(ctx)` for model providers (`hermes_cli/plugins_discovery.py:286`, `hermes_cli/plugin_validate.py:253-258`). All quota visibility is provided through the native `fetch_account_usage()` interface. The **companion plugin** (`antigravity-companion`, `kind: standalone`) provides the `hermes antigravity ...` CLI instead.
 
-Quota queries execute `agy -p "/usage" --output-format json` under an isolated HOME environment without consuming any model tokens or inference turns. Results are cached thread-safely for 60 seconds.
+Quota queries execute `agy -p "/usage" --output-format json` under an isolated HOME environment without consuming any model tokens or inference turns. Results are cached thread-safely for 60 seconds. Refreshes use single-flight execution so concurrent callers share a single subprocess, and an unforced query failure serves the stale cache. Distinct quota groups reported by `agy` (such as Gemini 4 Argon on paid plans alongside pooled Gemini Models) keep distinct labels in `/usage`.
 
 ### Multi-Account & Quota Rotation
 

@@ -52,6 +52,7 @@ try:
         _PROMPT_PREAMBLE,
         _ROLE_LABELS,
         _format_delta_prompt,
+        _latest_user_text,
         _format_messages_as_prompt,
         _longest_tool_call_prefix_match,
         _messages_match_prefix,
@@ -60,6 +61,7 @@ try:
         materialize_images,
         attached_image_paths,
     )
+    from .delivery import DeliveryWatch
     from .stream import AntigravityStream, collect_stream_completion
     from .accounts import (
         clear_session_pin,
@@ -110,6 +112,7 @@ except ImportError:
         _PROMPT_PREAMBLE,
         _ROLE_LABELS,
         _format_delta_prompt,
+        _latest_user_text,
         _format_messages_as_prompt,
         _longest_tool_call_prefix_match,
         _messages_match_prefix,
@@ -118,6 +121,7 @@ except ImportError:
         materialize_images,
         attached_image_paths,
     )
+    from delivery import DeliveryWatch
     from stream import AntigravityStream, collect_stream_completion
     from accounts import (
         clear_session_pin,
@@ -200,6 +204,7 @@ __all__ = [
     "_TEMP_DIR_CLEANUP_BACKOFF_SECONDS",
     "_force_rmtree",
     "_format_delta_prompt",
+    "_latest_user_text",
     "_format_messages_as_prompt",
     "_kill_process_tree",
     "_longest_tool_call_prefix_match",
@@ -609,6 +614,9 @@ class AntigravityClient:
 
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed = False
+        # Valid fresh-context full-send samples only. Worker deltas and
+        # concurrent oneshots are not comparable: see delivery.py and issue #29.
+        self._delivery_watch = DeliveryWatch()
         self._active_processes: set[subprocess.Popen] = set()
         # RLock (NOT a plain Lock) deliberately -- issue #10.
         #
@@ -801,6 +809,8 @@ class AntigravityClient:
         # The session is gone: any later usage from it belongs to a dead
         # session, and the next spawn must start from a clean baseline.
         self._worker_usage_baseline = {}
+        # Full-send diagnostics compare only fresh-context requests, never
+        # session counters or deltas. Their reference survives worker resets.
         if not keep_conversation:
             self._worker_conversation_id = None
             self._conversation_history = []
@@ -1011,6 +1021,10 @@ class AntigravityClient:
             tools=tools,
             is_worker=False,
             allowed_view_paths=attached_image_paths(messages),
+            prompt_chars=len(prompt_text),
+            # Oneshots run concurrently when the worker is busy. They have no
+            # comparable prior sample and must not mutate the worker watch.
+            delivery_watch=None,
         )
         if stream:
             return stream_iter
@@ -1065,13 +1079,16 @@ class AntigravityClient:
                     )
                     conv_id_to_resume = conv_candidate if resumable else None
 
+                comparable_full_send = not is_continuation
                 if is_continuation:
                     proc = self._get_or_spawn_worker(
                         resolved_model, effort, home_dir=home_dir, account_label=account_label,
                         conversation_id=conv_id_to_resume,
                     )
                     delta_msgs = messages_list[len(ref_history):]
-                    prompt_payload = _format_delta_prompt(delta_msgs)
+                    prompt_payload = _format_delta_prompt(
+                        delta_msgs, pending_user_text=_latest_user_text(messages_list)
+                    )
                     dump_prompt_debug(
                         prompt=prompt_payload,
                         branch="delta",
@@ -1105,6 +1122,7 @@ class AntigravityClient:
                         proc.stdin.write(json.dumps(event_msg) + "\n")
                         proc.stdin.flush()
                 except (BrokenPipeError, OSError):
+                    comparable_full_send = True
                     with self._lock:
                         self._terminate_worker_locked(keep_conversation=False)
                         self._purge_isolated_conversations()
@@ -1142,6 +1160,9 @@ class AntigravityClient:
                     messages=messages_list,
                     usage_baseline=worker_usage_baseline,
                     allowed_view_paths=attached_image_paths(messages_list),
+                    prompt_chars=len(prompt_payload),
+                    delivery_watch=self._delivery_watch if comparable_full_send else None,
+                    delivery_sample_key=f"{resolved_model}:{effort}",
                 )
                 if stream:
                     return stream_iter

@@ -150,6 +150,9 @@ class AntigravityStream(Iterator[Any]):
         messages: list[dict[str, Any]] | None = None,
         usage_baseline: dict[str, int] | None = None,
         allowed_view_paths: frozenset[str] | None = None,
+        prompt_chars: int = 0,
+        delivery_watch: Any = None,
+        delivery_sample_key: str = "",
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -192,6 +195,13 @@ class AntigravityStream(Iterator[Any]):
         # Cumulative usage snapshot of the worker session that owns this
         # stream; only worker streams receive one (see client._create_chat_completion).
         self.usage_baseline = usage_baseline
+        # Size of the prompt this stream's process was fed, so the usage chunk
+        # can be checked against it (delivery.py, issue #29).
+        self.prompt_chars = max(int(prompt_chars or 0), 0)
+        # Captured per request, not looked up on a mutable client at completion.
+        # Worker deltas and concurrent oneshots must never share samples.
+        self.delivery_watch = delivery_watch
+        self.delivery_sample_key = delivery_sample_key
         self.conversation_id = ""
         self._closed = False
         self._interrupted = False
@@ -970,6 +980,15 @@ class AntigravityStream(Iterator[Any]):
             # absorbs them. There is no yield between this computation and
             # the finish-reason yield, so chunk emission order is unchanged.
             input_tokens, output_tokens, total_tokens, cached_tokens = self._usage_totals(usage_data)
+
+            # Heuristic only (issue #29), restricted to comparable full sends.
+            # Include cache reads conservatively; never change reported usage.
+            watch = self.delivery_watch
+            if watch is not None and self.prompt_chars:
+                watch.observe(
+                    self.prompt_chars, input_tokens + cached_tokens,
+                    sample_key=self.delivery_sample_key,
+                )
 
             yield self._make_chunk(finish_reason=finish_reason)
 

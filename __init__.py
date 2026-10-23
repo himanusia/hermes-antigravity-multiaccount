@@ -288,6 +288,12 @@ def _classify_antigravity_error(
             "retryable": True,
             "should_compress": True,
         }
+    if "exceeded the output token limit" in err_str or "previous response was cut off" in err_str:
+        return {
+            "reason": "server_error",
+            "retryable": True,
+            "should_compress": False,
+        }
     if any(
         pattern in err_str
         for pattern in (

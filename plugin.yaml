@@ -1,6 +1,6 @@
 name: antigravity-subscription-directsdk
 manifest_version: 2
-version: 1.1.0
+version: 1.2.0
 kind: model-provider
 description: "Run Hermes on an Antigravity / Gemini subscription via the official agy CLI. Streams tokens, keeps multi-turn conversations across turns (up to 239k tokens), discovers models per account, maps thinking effort, and shows 5h/weekly quota in /usage. Additions: multi-account rotation by remaining quota, a native tool bridge that re-issues agy built-in tool calls as Hermes tools, and SOUL.md delivered as workspace rules."
 author: "himanusia (based on soyelmismo and neerazz)"
