@@ -1194,6 +1194,11 @@ class AntigravityPluginTests(unittest.TestCase):
         tmp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(tmp_dir.cleanup)
         client = AntigravityClient(cwd=tmp_dir.name)
+        # agy resumes by id only when that conversation's database is still on
+        # disk; the client checks the file before paying for a resume.
+        conv_dir = client._isolated_gemini_dir / "conversations"
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        (conv_dir / "conv-persistent-42.db").write_bytes(b"")
 
         def make_proc(conv_id, resp):
             proc = MagicMock()

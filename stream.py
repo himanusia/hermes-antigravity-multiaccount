@@ -196,6 +196,14 @@ class AntigravityStream(Iterator[Any]):
         self._closed = False
         self._interrupted = False
         self._finished = False
+        # A bridged native tool step aborts the process on purpose -- agy would
+        # otherwise execute the call itself -- but the CONVERSATION must
+        # survive: the next request feeds the tool result back as a delta into
+        # the resumed session. Dropping it forced a full replay of the whole
+        # transcript into a fresh, memoryless agy session, which is how a
+        # model ends up continuing the previous command and ignoring the
+        # user's latest message.
+        self._keep_conversation_on_close = False
         self._early_error: str | None = None
         self._generator = self._stream_generator()
         # Private single-thread executor for the async path, created lazily on
@@ -405,7 +413,12 @@ class AntigravityStream(Iterator[Any]):
             # leave the current one alone (issue #10 follow-up).
             if not self._finished and self.proc is self.client._worker_proc:
                 self._interrupted = True
-                self.client._terminate_worker()
+                # keep_conversation=True only for the native-tool bridge: the
+                # process must die before it runs the call, but its session is
+                # still the one the tool result belongs to.
+                self.client._terminate_worker(
+                    keep_conversation=self._keep_conversation_on_close
+                )
             self._release_worker_lock_once()
         else:
             with self.client._lock:
@@ -640,6 +653,11 @@ class AntigravityStream(Iterator[Any]):
                     step = event.get("step_update", {})
                     if not self.conversation_id:
                         self.conversation_id = step.get("conversation_id", "")
+                    # agy does not always repeat the id in `init`; a tool step
+                    # may be the first place it shows up. Record it here too, so
+                    # a bridged tool step still has a conversation to keep.
+                    if self.conversation_id and self.is_worker and self.client and hasattr(self.client, "_set_worker_conversation_id"):
+                        self.client._set_worker_conversation_id(self.conversation_id)
                     if step.get("step_type") == "tool" and self._is_attached_image_view(step):
                         continue
                     if step.get("step_type") == "tool":
@@ -652,6 +670,10 @@ class AntigravityStream(Iterator[Any]):
                             has_tool_calls = True
                             text_buffer = ""
                             yield self._make_chunk(tool_calls=[call])
+                            # Kill the process before it runs the call itself, but
+                            # keep its conversation so the tool result comes back
+                            # as a delta instead of a full transcript replay.
+                            self._keep_conversation_on_close = True
                             self.close()
                             neutralized_tool_step = True
                             break

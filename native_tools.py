@@ -9,11 +9,18 @@ native tools are still neutralized as before.
 
 from __future__ import annotations
 
+import itertools
 import json
 from types import SimpleNamespace
 from typing import Any, Callable
 
 Mapper = Callable[[dict[str, Any]], dict[str, Any] | None]
+
+# Tool-call ids must be unique inside one conversation: agy reports a stable
+# step_index per turn, so `agy_2_run_command` used to repeat every turn and
+# Hermes' sanitizer had to rename the duplicates. A process-wide counter keeps
+# each bridged call distinct.
+_STEP_SEQ = itertools.count(1)
 
 
 def _pick(params: dict[str, Any], *names: str) -> Any:
@@ -120,6 +127,6 @@ def translate(step: dict[str, Any], available: set[str], index: int) -> SimpleNa
     args = mapper(params)
     if args is None:
         return None
-    ident = f"agy_{step.get('step_index', index)}_{native}"
+    ident = f"agy_{next(_STEP_SEQ)}_{step.get('step_index', index)}_{native}"
     return SimpleNamespace(index=index, id=ident, type="function",
                            function=SimpleNamespace(name=hermes_name, arguments=json.dumps(args, ensure_ascii=False)))

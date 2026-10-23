@@ -7,6 +7,7 @@ finished a turn for ``ANTIGRAVITY_WORKER_IDLE_SECONDS`` (default 900).
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -149,11 +150,17 @@ class ConversationAccountGuardTests(WorkerIdleTests):
     class _Stop(Exception):
         pass
 
-    def _spawn_args(self, home_dir, label):
+    def _spawn_args(self, home_dir, label, *, conversation_db: bool = False):
         history = [{"role": "user", "content": "first"}]
         self.client._conversation_history = list(history)
         self.client._worker_conversation_id = "conv-1"
-        self.client._conversation_account = ("/acc/a", "a")
+        self.client._conversation_account = (home_dir, label)
+        if conversation_db:
+            # agy can only resume a conversation its HOME still holds the
+            # database for; without it the client must replay the full prompt.
+            conv_dir = Path(home_dir) / ".gemini" / "antigravity-cli" / "conversations"
+            conv_dir.mkdir(parents=True, exist_ok=True)
+            (conv_dir / "conv-1.db").write_bytes(b"")
         seen = {}
 
         def fake_spawn(model, effort, home_dir=None, account_label=None, conversation_id=None):
@@ -172,9 +179,11 @@ class ConversationAccountGuardTests(WorkerIdleTests):
         return seen
 
     def test_same_account_resumes_the_conversation(self):
-        seen = self._spawn_args("/acc/a", "a")
+        home = tempfile.mkdtemp(prefix="agy-acc-a-")
+        self.addCleanup(lambda: shutil.rmtree(home, ignore_errors=True))
+        seen = self._spawn_args(home, "a", conversation_db=True)
         self.assertEqual(seen["conversation_id"], "conv-1")
-        self.assertEqual((seen["home_dir"], seen["account_label"]), ("/acc/a", "a"))
+        self.assertEqual((seen["home_dir"], seen["account_label"]), (home, "a"))
 
     def test_other_account_starts_a_fresh_conversation(self):
         seen = self._spawn_args("/acc/b", "b")

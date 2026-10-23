@@ -27,7 +27,7 @@ class TranslateTests(unittest.TestCase):
         call = native_tools.translate(_step("run_command", {"CommandLine": "echo hi", "Cwd": "/w"}), {"terminal"}, 0)
         self.assertEqual(call.function.name, "terminal")
         self.assertEqual(json.loads(call.function.arguments), {"command": "echo hi", "workdir": "/w"})
-        self.assertEqual(call.id, "agy_2_run_command")
+        self.assertRegex(call.id, r"^agy_\d+_2_run_command$")
 
     def test_unavailable_hermes_tool_is_not_mapped(self):
         self.assertIsNone(native_tools.translate(_step("run_command", {"CommandLine": "x"}), {"read_file"}, 0))

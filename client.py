@@ -832,6 +832,22 @@ class AntigravityClient:
             if conv_id:
                 self._worker_conversation_id = conv_id
 
+    def _conversation_db_exists(self, conversation_id: str | None) -> bool:
+        """Is there a conversation agy can still resume by id?
+
+        agy stores each conversation as ``conversations/<id>.db`` under the
+        antigravity-cli dir of the HOME that started it. ``--conversation``
+        against a missing database starts the CLI from nothing, so resuming is
+        only attempted when that file is really on disk.
+        """
+        if not conversation_id:
+            return False
+        base = self._current_account_gemini_dir or self._isolated_gemini_dir
+        try:
+            return (Path(base) / "conversations" / f"{conversation_id}.db").is_file()
+        except OSError:
+            return False
+
     def _purge_isolated_conversations(self) -> None:
         """Purge isolated conversation database files on session reset or new conversation."""
         conv_dir = (self._current_account_gemini_dir or self._isolated_gemini_dir) / "conversations"
@@ -1025,19 +1041,29 @@ class AntigravityClient:
         if worker_acquired:
             try:
                 with self._lock:
-                    ref_history = (
-                        self._worker_history
-                        if (self._worker_proc is not None and self._worker_proc.poll() is None)
-                        else self._conversation_history
+                    live_worker = (
+                        self._worker_proc is not None and self._worker_proc.poll() is None
                     )
+                    ref_history = self._worker_history if live_worker else self._conversation_history
                     account_key = (str(home_dir) if home_dir else None, account_label)
                     # A different account cannot resume this conversation: its
                     # database lives under the other account's HOME.
+                    same_account = self._conversation_account in (None, account_key)
+                    conv_candidate = self._worker_conversation_id
+                    resumable = bool(conv_candidate) and self._conversation_db_exists(conv_candidate)
+                    # A delta prompt only carries what changed, so it is only
+                    # correct when the session that owns the history still
+                    # exists: either the process is alive, or agy can resume the
+                    # conversation from disk. With neither, the delta would hand
+                    # a memoryless process a tool result and nothing else -- the
+                    # model then continues the previous command as if the user's
+                    # latest message never arrived. Full prompt instead.
                     is_continuation = (
-                        self._conversation_account in (None, account_key)
+                        same_account
                         and _messages_match_prefix(ref_history, messages_list)
+                        and (live_worker or resumable)
                     )
-                    conv_id_to_resume = self._worker_conversation_id if is_continuation else None
+                    conv_id_to_resume = conv_candidate if resumable else None
 
                 if is_continuation:
                     proc = self._get_or_spawn_worker(
