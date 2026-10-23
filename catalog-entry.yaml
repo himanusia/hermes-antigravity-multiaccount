@@ -1,13 +1,13 @@
 name: antigravity-subscription-directsdk
-repo: https://github.com/soyelmismo/hermes-antigravity-subscription
-sha: 94f7132b040310c919d555cab43dffc3aea4ec2d
-description: "Run Hermes on an Antigravity / Gemini subscription via the official agy CLI (DirectSDK path). Streams tokens progressively, maps thinking effort, runs from a private temp directory, and aborts reported native tool steps."
-maintainer: soyelmismo
+repo: https://github.com/himanusia/hermes-antigravity-multiaccount
+sha: 1f776a1
+description: "Run Hermes on an Antigravity / Gemini subscription through the official agy CLI: token streaming, per-account model discovery, thinking-effort mapping, 5h/weekly quota in /usage, multi-account rotation by remaining quota, a native tool bridge that re-issues agy tool steps as Hermes tools without losing the conversation, and SOUL.md delivered as workspace rules."
+maintainer: himanusia
 tier: community
 category: models
-requires_hermes: '>=0.21.0'
-docs_url: https://github.com/soyelmismo/hermes-antigravity-subscription#readme
-version: 1.0.0
+requires_hermes: '>=0.21.4'
+docs_url: https://github.com/himanusia/hermes-antigravity-multiaccount#readme
+version: 1.2.0
 platforms:
 - linux
 - macos

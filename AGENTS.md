@@ -22,8 +22,12 @@ This repository implements the `antigravity-subscription-directsdk` provider plu
 
 - **Test Suite**: Run the test suite before committing:
   ```bash
-  PYTHONPATH=/usr/local/lib/hermes-agent:. pytest
+  pip install "pytest==9.1.1"
+  HERMES_HOME=$(mktemp -d) PYTHONPATH=/path/to/hermes-agent:$PWD python -m pytest tests/ -q
   ```
+  `PYTHONPATH` points at a Hermes source checkout (the suite imports `providers`),
+  and `HERMES_HOME` must be empty so the provider registry does not import sibling
+  plugins during collection.
 - **Security Boundaries**:
   - Do not add `--dangerously-skip-permissions` to default arguments.
   - Preserve isolated HOME directory sandboxing and token symlink safeguards.

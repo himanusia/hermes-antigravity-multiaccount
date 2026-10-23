@@ -2,7 +2,7 @@
 
 [![Hermes Agent Plugin](https://img.shields.io/badge/Hermes%20Agent-Plugin-purple.svg)](https://hermes-agent.nousresearch.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tested with Hermes](https://img.shields.io/badge/Hermes-v0.21%2B-green.svg)](https://github.com/nousresearch/hermes-agent)
+[![Tested with Hermes](https://img.shields.io/badge/Hermes-v0.21.4%2B-green.svg)](https://github.com/nousresearch/hermes-agent)
 
 Hermes Agent model provider that routes inference through an active Google Antigravity account using the local `agy` binary.
 
@@ -27,7 +27,7 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 
 - **Token streaming**: Reads stdout chunks from `agy --output-format stream-json` and yields standard completion deltas.
 - **Tool call routing**: The model emits `<tool_call>` tags in text. The plugin parses these into OpenAI function call deltas, so Hermes executes tools on the host instead of `agy`.
-- **Tool execution guard**: `agy` registers local system tools by default. This plugin runs `agy` in headless mode without permissions skip flags. If `agy` attempts to execute an internal tool step, the stream closes and terminates the child process; steps that map to a Hermes tool are re-issued as that tool call (see *Native tool bridge*).
+- **Tool execution guard**: `agy` registers local system tools by default. This plugin runs `agy` in headless mode without permissions skip flags. If `agy` emits an internal tool step, the stream closes and terminates the child process; steps that map to a Hermes tool are re-issued as that tool call (see *Native tool bridge*). The agy **conversation** is kept across that kill, so the tool result returns as a delta into the resumed session instead of a full replay.
 - **Thinking effort mapping**: Maps Hermes reasoning effort settings (`low`, `medium`, `high`) to backend model variants (`gemini-3.8-flash-low`, `gemini-3.8-flash-high`).
 - **Subagent concurrency**: Each completion turn runs in its own process group (`start_new_session=True`). Multiple Hermes subagents can request completions concurrently without shared state.
 - **Filesystem isolation**: Subprocesses run in an isolated, private temporary working directory per client and slash commands are disabled. Project `AGENTS.md` files are not read. The only `GEMINI.md` agy sees is the one this plugin writes into that directory (see *Native tool bridge and workspace rules*).
@@ -82,19 +82,19 @@ Reasoning text in `stream-json` remains blocked upstream: `agy` exposes no flag 
 
 ### Model Compatibility
 
-`agy` embeds its own system prompt ("you are Antigravity, you have `run_command`, `view_file`, ...") before the plugin's preamble. Some models obey `agy`'s prompt over the plugin's `<tool_call>` protocol and invoke native tools, which headless mode soft-denies. The plugin detects this and terminates the stream, but the turn is lost.
+`agy` embeds its own system prompt ("you are Antigravity, you have `run_command`, `view_file`, ...") before the plugin's preamble. Some models obey `agy`'s prompt over the plugin's `<tool_call>` protocol and invoke native tools, which headless mode denies. Those turns are no longer lost: a native step that maps to a tool present in the request is re-issued as that Hermes tool, and the conversation is kept, so the tool result returns as a delta into the resumed agy session (see *Native tool bridge*).
 
 | Model | `<tool_call>` Protocol | Notes |
 | :--- | :--- | :--- |
 | `gemini-3.8-flash` | Follows | Tested with full toolset (~40 tools) |
 | `gemini-3.7-flash` | Follows | Tested with full toolset |
-| `gemini-3.6-flash` | Ignores | Goes native even with a single tool schema |
+| `gemini-3.6-flash` | Ignores | Goes native even with a single tool schema; every tool step takes the bridge |
 | `gemini-3.1-pro` | Follows | Tested with full toolset |
 | `claude-opus-4-6-thinking` | Follows | Tested with full toolset |
 | `claude-sonnet-4-6` | Partial | Works with moderate toolsets (tested up to 10 tools); refuses or flips to native with large toolsets (~40 tools) |
 | `gpt-oss-120b` | Follows | Tested with full toolset |
 
-Models that ignore the protocol attempt `agy`'s native `RunCommand`/`WriteToFile` steps. The plugin neutralizes these (stream watcher kills the process), but every tool-using turn fails. This is an upstream `agy` limitation: the persona prompt is embedded in the closed binary with no configuration surface to suppress it.
+Models that ignore the protocol attempt `agy`'s native `RunCommand`/`WriteToFile` steps. A step that maps to a tool in the request is re-issued as that Hermes tool and the agy conversation survives, so the turn continues normally. A step with no Hermes equivalent (`browser_click_element`, an unknown agy tool) is still neutralized: the stream watcher kills the process and that single turn ends empty. Prefer the models marked *Follows* for tool-heavy work; the rest work but go through the bridge. This is an upstream `agy` limitation: the persona prompt is embedded in the closed binary with no configuration surface to suppress it.
 
 ---
 
@@ -149,7 +149,7 @@ Strict baseline: `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TERM`, `TMPDIR`/`TEM
    agy --version
    ```
 2. **Hermes Agent**:
-   Version `0.21.0` or higher.
+   Version `0.21.4` or higher (the manifest floor).
    ```bash
    hermes --version
    ```
@@ -350,11 +350,18 @@ Account credentials are stored under `~/.agy-accounts/<label>/` and the registry
 
 ## Tests
 
-Run the test suite:
+The suite imports `providers` from a Hermes **source** checkout (the PyPI wheel lags below the manifest floor), so point `PYTHONPATH` at one:
 
 ```bash
-PYTHONPATH=/usr/local/lib/hermes-agent:. pytest
+pip install "pytest==9.1.1"     # pytest is not a Hermes dependency
+git clone --depth 1 --branch v0.21.4 https://github.com/NousResearch/hermes-agent /tmp/hermes-src
+
+# HERMES_HOME must hold no other plugins: the provider registry scans it during
+# collection, and a sibling plugin's imports would run here too.
+HERMES_HOME=$(mktemp -d) PYTHONPATH=/tmp/hermes-src:$PWD python -m pytest tests/ -q
 ```
+
+Continuous integration runs exactly this on Linux and Windows (Python 3.11) for every branch and every pull request.
 
 ---
 
