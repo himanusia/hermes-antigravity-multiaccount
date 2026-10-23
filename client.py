@@ -42,6 +42,7 @@ try:
         build_child_env,
         is_authenticated,
         resolve_agy_command,
+        reap_orphan_agy_processes,
         resolve_real_token_path,
         setup_isolated_home,
         start_stderr_drainer,
@@ -99,6 +100,7 @@ except ImportError:
         build_child_env,
         is_authenticated,
         resolve_agy_command,
+        reap_orphan_agy_processes,
         resolve_real_token_path,
         setup_isolated_home,
         start_stderr_drainer,
@@ -590,6 +592,7 @@ class AntigravityClient:
         cwd: str | None = None,
         **_: Any,
     ):
+        reap_orphan_agy_processes()
         self.api_key = api_key or "antigravity-directsdk"
         self.base_url = base_url or AGY_MARKER_BASE_URL
         self._command = command or resolve_agy_command()

@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,64 @@ def terminate_process(proc: subprocess.Popen) -> None:
         proc.wait(timeout=2)
     except Exception:
         _kill_process_tree(proc)
+
+
+# ---- orphan reaping -----------------------------------------------------------------------------
+# agy runs in its own process group, so a hard-killed Hermes process (SIGKILL, crash, a timeout
+# kill) leaves the child reparented to launchd/init with nothing that can ever talk to it again,
+# while it still holds a live model session and ~100MB. Sweep those orphans whenever a client
+# starts; live parents (gateway, background workers) have a real ppid and are never touched.
+_ORPHAN_INTERVAL = 300.0
+_ORPHAN_LOCK = threading.Lock()
+_ORPHAN_AT = 0.0
+
+
+def _quiet(argv: list[str]) -> str:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def reap_orphan_agy_processes() -> int:
+    """Kill agy children whose owning Hermes process is gone. Returns the number signalled."""
+    if os.name == "nt":
+        return 0
+    global _ORPHAN_AT
+    with _ORPHAN_LOCK:
+        now = time.monotonic()
+        if now - _ORPHAN_AT < _ORPHAN_INTERVAL:
+            return 0
+        _ORPHAN_AT = now
+        killed = 0
+        signalled: list[int] = []
+        for raw in _quiet(["pgrep", "-f", "input-format stream-json"]).split():
+            if not raw.isdigit():
+                continue
+            pid = int(raw)
+            if pid == os.getpid():
+                continue
+            cmdline = _quiet(["ps", "-o", "command=", "-p", str(pid)])
+            if "agy" not in cmdline or "--input-format" not in cmdline:
+                continue  # not one of our agy workers
+            if _quiet(["ps", "-o", "ppid=", "-p", str(pid)]).strip() != "1":
+                continue  # parent still alive: not an orphan
+            try:
+                os.killpg(pid, signal.SIGTERM)  # own process group: pid leads it
+            except (ProcessLookupError, PermissionError):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGTERM)
+            killed += 1
+            signalled.append(pid)
+        if signalled:
+            # agy keeps running while a request is in flight; escalate for anything still standing.
+            time.sleep(1.5)
+            for pid in signalled:
+                if not _quiet(["ps", "-o", "pid=", "-p", str(pid)]).strip():
+                    continue
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
+        return killed
 
 
 _DEFAULT_STDERR_LIMIT = 64 * 1024  # 64 KiB of text

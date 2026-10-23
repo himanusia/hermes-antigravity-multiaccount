@@ -784,8 +784,12 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertEqual(models.resolve_model_alias("opus", catalog), "claude-opus-5-5")
 
     def test_profile_fallback_models_is_empty_for_account_scoping(self):
+        # Account-scoped discovery stays authoritative, but a curated floor is required: the GUI
+        # picker's read path serves a cold provider-model cache as an empty catalog, which renders
+        # the provider as "(needs setup)" and makes the row unselectable.
         profile = get_provider_profile("antigravity-subscription-directsdk")
-        self.assertEqual(profile.fallback_models, ())
+        self.assertTrue(profile.fallback_models)
+        self.assertIn("gemini-3.8-flash", profile.fallback_models)
 
     def test_fetch_models_lists_every_family_once(self):
         import models

@@ -701,7 +701,10 @@ antigravity_profile = AntigravitySubscriptionDirectSDKProfile(
     process_command_env_vars=("ANTIGRAVITY_COMMAND", "AGY_CLI_PATH", "ANTIGRAVITY_CLI_PATH"),
     process_args_env_var="ANTIGRAVITY_ARGS",
     default_aux_model="gemini-3.8-flash",
-    fallback_models=(),  # Account-scoped models: discovered dynamically via fetch_models() (agy models)
+    # Account-scoped models are discovered via fetch_models() (agy models), but a curated floor is
+    # required: the GUI picker read path (non_blocking_catalogs) serves a cold disk cache as an empty
+    # catalog, which renders this provider as "needs setup" and makes the row unselectable.
+    fallback_models=("gemini-3.8-flash", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b"),
     supports_vision=True,
     unsupported_response_formats=("json_schema",),
     classify_api_error=_classify_antigravity_error,
