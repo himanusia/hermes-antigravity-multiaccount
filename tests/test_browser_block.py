@@ -40,6 +40,10 @@ class BrowserBlockTests(unittest.TestCase):
         self.assertNotIn("agy-nobrowser", env.get("PATH", ""))
 
     def test_shim_refuses_to_launch_a_browser(self):
+        # The shim is a POSIX `#!/bin/sh` script (BROWSER=/usr/bin/false is POSIX
+        # only too), so there is nothing to execute on Windows.
+        if os.name == "nt":
+            self.skipTest("no-browser shims are POSIX-only")
         env = accounts.probe_env("/tmp")
         shim = os.path.join(env["PATH"].split(os.pathsep)[0], "open")
         res = subprocess.run([shim, "https://accounts.google.com/"], capture_output=True, text=True)

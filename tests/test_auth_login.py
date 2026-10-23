@@ -104,7 +104,10 @@ def test_refresh_reprobes_and_restores_an_account_that_was_fixed(capsys):
 def test_refresh_names_what_each_unusable_account_needs(capsys):
     add_account("a@example.com", "/h/a", email="a@example.com")
     add_account("b@example.com", "/h/b", email="b@example.com")
-    states = {"/h/a": "needs_login", "/h/b": "not_eligible"}
+    # The registry stores the resolved home path, so the fake is keyed the same
+    # way or the lookup misses on Windows (D:\h\a vs /h/a).
+    states = {str(Path("/h/a").expanduser().resolve()): "needs_login",
+              str(Path("/h/b").expanduser().resolve()): "not_eligible"}
     with patch("__init__.probe_account_state", side_effect=lambda home, *a, **k: (states[home], None)):
         auth_handler("refresh", SimpleNamespace(target=None, label=None))
     out = capsys.readouterr().out

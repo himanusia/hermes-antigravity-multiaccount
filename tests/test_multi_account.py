@@ -53,6 +53,17 @@ from accounts import (
 from __init__ import antigravity_profile, auth_handler
 from client import AntigravityClient, _RotatingStreamWrapper, _log_rotation_failover, _resolve_cooldown_reset
 
+
+def _norm(path: str) -> str:
+    """Home-dir key the way the registry stores it.
+
+    ``accounts.add_account`` resolves the home dir before saving, so fakes and
+    expected values must use the same normalization or every lookup misses on
+    Windows, where ``/path/x`` resolves to ``D:\\path\\x``.
+    """
+    return str(Path(path).expanduser().resolve())
+
+
 def make_mock_id_token(email: str) -> str:
     header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256"}).encode()).decode().rstrip("=")
     payload = base64.urlsafe_b64encode(json.dumps({"email": email, "name": "Test User"}).encode()).decode().rstrip("=")
@@ -327,7 +338,7 @@ class TestMultiAccount(unittest.TestCase):
 
         add_account("yazid", "/path/yazid")
         add_account("shinti", "/path/shinti")
-        accounts_mod.mark_model_unsupported({"label": "yazid", "home_dir": "/path/yazid"}, "claude-sonnet-5-5-medium")
+        accounts_mod.mark_model_unsupported({"label": "yazid", "home_dir": _norm("/path/yazid")}, "claude-sonnet-5-5-medium")
         with patch("accounts.fetch_usage_for_home", return_value=None), \
                 patch.dict(os.environ, {"ANTIGRAVITY_ROTATION": "round_robin"}):
             for _ in range(3):
@@ -425,7 +436,7 @@ class TestMultiAccount(unittest.TestCase):
                     model="claude-sonnet-5-5-medium", messages=[{"role": "user", "content": "hi"}], stream=False,
                 )
         self.assertEqual(res.choices[0].message.content, "host-ok")
-        self.assertEqual(served, ["/path/yazid", None])
+        self.assertEqual(served, [_norm("/path/yazid"), None])
 
     def test_pick_account_skips_cooldown(self):
         add_account("acc1", "/path/1")
@@ -852,8 +863,8 @@ class HardeningTests(unittest.TestCase):
         add_account("unreadable", "/path/unreadable")
         add_account("healthy", "/path/healthy")
         usages = {
-            "/path/unreadable": None,
-            "/path/healthy": {
+            _norm("/path/unreadable"): None,
+            _norm("/path/healthy"): {
                 "gemini": {"5h": {"remaining_fraction": 0.6}, "weekly": {"remaining_fraction": 0.6}},
             },
         }
@@ -874,8 +885,8 @@ class HardeningTests(unittest.TestCase):
         add_account("broken", "/path/broken")
         add_account("healthy", "/path/healthy")
         usages = {
-            "/path/broken": {"gemini": {"5h": {"remaining_fraction": "garbage"}, "weekly": {}}},
-            "/path/healthy": {
+            _norm("/path/broken"): {"gemini": {"5h": {"remaining_fraction": "garbage"}, "weekly": {}}},
+            _norm("/path/healthy"): {
                 "gemini": {"5h": {"remaining_fraction": 0.9}, "weekly": {"remaining_fraction": 0.9}},
             },
         }
