@@ -82,23 +82,45 @@ def _search_files(p: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _web_search(p: dict[str, Any]) -> dict[str, Any] | None:
-    q = _pick(p, "query", "Query")
+    # agy 1.4.7 sends {"query": ...} for search_web (captured from a real
+    # stream-json step); the other keys cover the provider-level variants of the
+    # same action without inventing a different meaning.
+    q = _pick(p, "query", "Query", "q", "SearchQuery", "queryText")
     return {"query": str(q)} if q else None
 
 
 def _web_extract(p: dict[str, Any]) -> dict[str, Any] | None:
-    url = _pick(p, "Url", "url")
-    return {"urls": [str(url)]} if url else None
+    raw = _pick(p, "Url", "url", "urls", "Urls", "AbsolutePathUri", "uri", "Link", "href")
+    if not raw:
+        return None
+    values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+    urls = [str(v) for v in values if v not in (None, "")]
+    return {"urls": urls} if urls else None
 
 
 # agy tool name -> (Hermes tool name, argument mapper)
+#
+# Only names that this install's agy actually uses belong here. `search_web` and
+# `read_url_content` are the two web-capable native tools in agy 1.4.7; there is
+# no search_google / fetch_url / open_url / browse native tool in that binary
+# (byte-level search of the CLI), so no speculative aliases are mapped.
+# agy's browser tools (read_browser_page, open_browser_url, browser_subagent)
+# operate on agy's own browser session and have no honest Hermes equivalent, so
+# they stay neutralized on purpose.
 NATIVE_TO_HERMES: dict[str, tuple[str, Mapper]] = {
     "run_command": ("terminal", _terminal),
     "view_file": ("read_file", _read_file),
+    # Observed live from agy 1.4.7: read_file carries Path/StartLine/EndLine.
+    "read_file": ("read_file", _read_file),
     "write_to_file": ("write_file", _write_file),
+    # write_file is the same action under its shorter advertised name.
+    "write_file": ("write_file", _write_file),
     "grep_search": ("search_files", _search_content),
     "find_by_name": ("search_files", _search_files),
     "search_web": ("web_search", _web_search),
+    # Provider-level spelling of the same search action (seen in agy's binary as
+    # a model-tool type, not as a harness step today).
+    "web_search": ("web_search", _web_search),
     "read_url_content": ("web_extract", _web_extract),
 }
 
