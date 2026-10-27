@@ -35,6 +35,20 @@ class SoulRulesTests(unittest.TestCase):
         self.assertLess(rules.index("MANGO-31"), rules.index("helpful assistant"))
         self.assertIn("<tool_call>", rules)
 
+    def test_rules_ask_for_a_sentence_before_every_tool_call(self):
+        """The desktop collapses a run of tool calls into one grey line unless the
+        assistant writes text between them, so the contract has to ask for it."""
+        rules = soul.build_rules(["You are a helpful assistant."], _PROMPT_PREAMBLE)
+        inline = _format_messages_as_prompt(
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        )
+        for text in (rules, inline):
+            self.assertIn("ONE short sentence", text)
+            self.assertIn("nothing in front of it", text)
+        # The old wording forbade any prose next to a tool call, which is what
+        # starved the transcript of the lines it needs.
+        self.assertNotIn("emit ONLY <tool_call>", rules)
+
     def test_soul_not_duplicated_when_hermes_already_injected_it(self):
         rules = soul.build_rules([SOUL_TEXT + "\n\nMore Hermes instructions."], _PROMPT_PREAMBLE)
         self.assertEqual(rules.count("MANGO-31"), 1)
