@@ -29,7 +29,12 @@ _PROMPT_PREAMBLE = (
     "You are being used strictly as an LLM inference backend for Hermes Agent.",
     "All tool executions and filesystem interactions are performed exclusively by Hermes Agent on the host side.",
     "IMPORTANT INSTRUCTIONS FOR TOOLS:",
-    "- If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in your text output.",
+    # The lead-in sentence is not decoration: Hermes renders every tool call as
+    # a row, and a turn whose calls carry no text in between collapses into a
+    # single grey summary line in the desktop transcript. One sentence per call
+    # keeps each step visible, the way it reads under Claude Code.
+    "- Before each tool call, write ONE short sentence (max 15 words, in the user's language) saying what you are about to do, then emit the <tool_call>{...}</tool_call> block for that call.",
+    "- Never emit a tool call with nothing in front of it: that sentence is the step the user reads while Hermes runs the tool.",
     "- Each tool call must be a JSON object containing 'id', 'type': 'function', and 'function': {'name': '...', 'arguments': '...'}.",
     "- 'arguments' must be a JSON-encoded string containing the function arguments.",
     "- Do NOT execute local shell commands or file operations directly; only output <tool_call> tags so Hermes can execute them safely.",
@@ -41,6 +46,15 @@ _PROMPT_PREAMBLE = (
 
 _TOOL_CALL_PREFIXES = tuple(
     "<tool_call>"[:i] for i in range(len("<tool_call>"), 0, -1)
+)
+
+# Restated at the tail of every fresh user turn. The preamble is long and sits
+# far above the request; the desktop only keeps each step on its own row while
+# the assistant writes something between calls, so this line has to survive the
+# distance.
+_NARRATION_REMINDER = (
+    "REMINDER: before each tool call, write one short sentence (max 15 words, the user's language) "
+    "saying what you are about to do, then make the call."
 )
 
 
@@ -462,7 +476,8 @@ def _format_delta_prompt(
         parts.append(
             "Continue the conversation from the latest tool result. "
             "REMINDER: You are in HEADLESS INFERENCE MODE. Native tools are disabled. "
-            "If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in your text output. "
+            "If you need to call a tool, write one short sentence saying what you are about to do, "
+            "then emit the <tool_call>{...}</tool_call> block for that call. "
             "Do NOT invoke native tools directly."
         )
         if pending_user_text:
@@ -471,6 +486,7 @@ def _format_delta_prompt(
         user_text = (pending_user_text or _latest_user_text(valid_messages)) if recovery_turn else _render_message_content(last_msg.get("content"))
         if user_text:
             parts.append(_latest_user_request_section(user_text))
+        parts.append(_NARRATION_REMINDER)
     else:
         parts.append("Continue the conversation from the latest message above.")
     return "\n\n".join(s.strip() for s in parts if s and s.strip())
