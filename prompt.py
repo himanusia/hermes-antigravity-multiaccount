@@ -182,6 +182,7 @@ def _latest_user_request_section(user_text: str) -> str:
         "INSTRUCTION: Respond directly and specifically to the LATEST USER REQUEST above. "
         "Do NOT repeat previous architectural summaries, code reviews, or overview boilerplate unless explicitly asked."
         " If the LATEST USER REQUEST comments on, questions, or gives feedback about prior work rather than asking to continue it, address THAT message and do NOT silently continue the earlier task. If the user's intent is genuinely ambiguous, ask ONE short clarifying question instead of proceeding."
+        "\n\n" + _NARRATION_REMINDER
     )
 
 
@@ -486,7 +487,6 @@ def _format_delta_prompt(
         user_text = (pending_user_text or _latest_user_text(valid_messages)) if recovery_turn else _render_message_content(last_msg.get("content"))
         if user_text:
             parts.append(_latest_user_request_section(user_text))
-        parts.append(_NARRATION_REMINDER)
     else:
         parts.append("Continue the conversation from the latest message above.")
     return "\n\n".join(s.strip() for s in parts if s and s.strip())
